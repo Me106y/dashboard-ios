@@ -1,6 +1,14 @@
 import Metal
 import simd
 
+// MARK: - grayscale_shader.glsl
+
+final class GrayscaleStage: ShaderPass {
+    init(name: String = "Grayscale", input: TextureHandle, output: TextureHandle) {
+        super.init(name: name, fragment: "fs_grayscale", input: input, output: output)
+    }
+}
+
 // MARK: - 缩放到指定分辨率（替代上游 ScaleToResolutionStage / GenerateMipmapStage）
 
 /// 上游用 `glGenerateMipmap` + 双线性降采样保证质量；iOS 侧直接用线性采样的

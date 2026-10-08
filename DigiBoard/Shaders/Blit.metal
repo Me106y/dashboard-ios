@@ -1,6 +1,6 @@
 //  公共顶点 / 片元着色器
 //  对应上游 res/raw/{vertex_shader, texture, passthrough_shader, letterboxing_shader,
-//                     corner_shader, line_shader, camera_shader}.glsl
+//                     camera_shader}.glsl
 #include <metal_stdlib>
 using namespace metal;
 
@@ -20,7 +20,11 @@ static inline QuadOut makeQuad(uint vid) {
     float2 c = float2(float(vid & 1u), float(vid >> 1u));
     QuadOut o;
     o.position = float4(c * 2.0 - 1.0, 0.0, 1.0);
-    o.uv = float2(c.x, c.y);
+    // 注意：NDC 的 y 轴朝上，纹理 v 轴朝下，这里必须翻转一次。
+    // 少了这次翻转，全屏 pass 会把画面上下颠倒——
+    // 后果是管线内部纹理与 Core ML 输出的 mask 垂直错位（人像遮罩永远圈不到人），
+    // 而且只有经过奇数个 pass 的分支才会显现，极难排查。
+    o.uv = float2(c.x, 1.0 - c.y);
     return o;
 }
 
@@ -65,12 +69,6 @@ fragment float4 fs_texture(QuadOut in [[stage_in]],
     return source.sample(kLinearSampler, in.uv);
 }
 
-// MARK: - passthrough_shader.glsl
-fragment float4 fs_passthrough(QuadOut in [[stage_in]],
-                               texture2d<float> framebuffer [[texture(0)]]) {
-    return framebuffer.sample(kLinearSampler, in.uv);
-}
-
 // MARK: - camera_shader.glsl
 // iOS 侧用 CVMetalTextureCache 拿到的是 BGRA 纹理，且已按视频旋转角出图，
 // 所以这里只保留一次可选的纵向翻转。
@@ -82,34 +80,3 @@ fragment float4 fs_camera(QuadOut in [[stage_in]],
     return camera.sample(kLinearSampler, uv);
 }
 
-// MARK: - line_shader.glsl：纯色（连线 / 边框）
-fragment float4 fs_color(QuadOut in [[stage_in]],
-                         constant float4 &color [[buffer(0)]]) {
-    return color;
-}
-
-// MARK: - corner_shader.glsl：角点手柄（绿色圆点 + 边缘淡出）
-
-struct HandleVertexOut {
-    float4 position [[position]];
-    float2 local;    // -0.5 .. 0.5
-};
-
-vertex HandleVertexOut vs_corner(uint vid [[vertex_id]],
-                                 constant float4 &rect [[buffer(0)]]) {
-    float2 c = float2(float(vid & 1u), float(vid >> 1u));
-    HandleVertexOut o;
-    o.position = float4(rect.x + c.x * rect.z, rect.y + c.y * rect.w, 0.0, 1.0);
-    o.local = c - 0.5;
-    return o;
-}
-
-fragment float4 fs_corner(HandleVertexOut in [[stage_in]]) {
-    float d = dot(in.local, in.local);
-    if (d > 0.25) { discard_fragment(); }
-    if (d > 0.008) {
-        float alpha = saturate((0.25 - d) / (0.25 - 0.008));
-        return float4(0.0, 1.0, 0.0, alpha);
-    }
-    return float4(0.0, 1.0, 0.0, 1.0);
-}

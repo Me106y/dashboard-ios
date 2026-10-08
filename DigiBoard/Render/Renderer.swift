@@ -22,16 +22,19 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var logFrames = 0
 
     /// 调试期抓帧：抓一帧指定句柄的纹理到指定路径后自动关闭
-    struct CaptureRequest {
+    struct CaptureTarget {
         let handle: TextureHandle
         let url: URL
+    }
+    /// 一次抓取多个句柄（同帧，便于对齐比对）
+    struct CaptureRequest {
+        let targets: [CaptureTarget]
     }
     var captureRequest: CaptureRequest?
     private var captureDone = false
     /// 抓帧暂存：帧内 blit 到这里，完成回调再异步回读，
     /// 这样即使目标纹理是「本帧用完就回收」的也可以抓。
-    private var captureStaging: MTLTexture?
-    private var captureURL: URL?
+    private var captureStaging: [(MTLTexture, URL)] = []
 
     init?(nodes: [PipelineNode]) {
         guard let metal = MetalContext() else { return nil }
@@ -139,27 +142,27 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
 
         // 3.5) 调试期抓帧：在帧内把目标纹理拷到 shared 暂存纹理
-        if let request = captureRequest, !captureDone,
-           let source = try? ctx.texture(request.handle) {
-            captureDone = true
-            captureURL = request.url
-
-            let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: source.pixelFormat,
-                                                                      width: source.width,
-                                                                      height: source.height,
-                                                                      mipmapped: false)
-            descriptor.storageMode = .shared
-            descriptor.usage = [.shaderRead, .renderTarget]
-            captureStaging = metal.device.makeTexture(descriptor: descriptor)
-
-            if let staging = captureStaging, let blit = commandBuffer.makeBlitCommandEncoder() {
-                blit.copy(from: source, sourceSlice: 0, sourceLevel: 0,
-                          sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                          sourceSize: MTLSize(width: source.width, height: source.height, depth: 1),
-                          to: staging, destinationSlice: 0, destinationLevel: 0,
-                          destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
-                blit.endEncoding()
+        if let request = captureRequest, !captureDone {
+            var blit: MTLBlitCommandEncoder?
+            for target in request.targets {
+                guard let source = try? ctx.texture(target.handle) else { continue }
+                let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: source.pixelFormat,
+                                                                          width: source.width,
+                                                                          height: source.height,
+                                                                          mipmapped: false)
+                descriptor.storageMode = .shared
+                descriptor.usage = [.shaderRead, .renderTarget]
+                guard let staging = metal.device.makeTexture(descriptor: descriptor) else { continue }
+                if blit == nil { blit = commandBuffer.makeBlitCommandEncoder() }
+                blit?.copy(from: source, sourceSlice: 0, sourceLevel: 0,
+                           sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                           sourceSize: MTLSize(width: source.width, height: source.height, depth: 1),
+                           to: staging, destinationSlice: 0, destinationLevel: 0,
+                           destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                captureStaging.append((staging, target.url))
             }
+            if !request.targets.isEmpty { captureDone = true }
+            blit?.endEncoding()
         }
 
         // 4) 非 persistent 纹理在 GPU 用完之后才归还池中，
@@ -202,14 +205,16 @@ final class Renderer: NSObject, MTKViewDelegate {
             }
 
             // 调试期抓帧（只在指定帧做一次）
-            if let staging = self.captureStaging, let url = self.captureURL {
-                self.captureStaging = nil
-                self.captureURL = nil
+            if !self.captureStaging.isEmpty {
+                let pending = self.captureStaging
+                self.captureStaging = []
                 // 绝不在这里同步等待：完成回调跑在 Metal 内部线程，
                 // 再建命令缓冲 + waitUntilCompleted 会死锁。
                 DispatchQueue.global(qos: .utility).async {
-                    let ok = FrameCapture.write(staging: staging, to: url)
-                    print("[CAPTURE] \(ok ? "已写出" : "写出失败") \(url.path)")
+                    for (staging, url) in pending {
+                        let ok = FrameCapture.write(staging: staging, to: url)
+                        print("[CAPTURE] \(ok ? "已写出" : "写出失败") \(url.lastPathComponent)")
+                    }
                 }
             }
             self.stats.record(gpuSeconds: buffer.gpuEndTime - buffer.gpuStartTime,

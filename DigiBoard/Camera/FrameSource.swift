@@ -9,6 +9,12 @@ import UIKit
 protocol FrameSource: AnyObject {
     var currentTexture: MTLTexture? { get }
     var resolution: CGSize { get }
+    /// 每个渲染帧推进一次。相机是实时的，无需推进；视频源在这里解码下一帧。
+    func advance()
+}
+
+extension FrameSource {
+    func advance() {}
 }
 
 extension CameraFrameSource: FrameSource {}

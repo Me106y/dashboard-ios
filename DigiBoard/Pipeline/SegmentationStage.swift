@@ -18,8 +18,14 @@ final class SegmentationStage: TextureProducer, TextureConsumer {
     private let provider: SegmentationProvider
     private let queue = DispatchQueue(label: "com.zhuanz.digiboard.segmentation", qos: .userInitiated)
 
-    /// 每 N 帧推理一次（30fps / 5 ≈ 6Hz，与上游 UpdateEveryXFrames 的思路一致）
-    var frameInterval = 5
+    /// 每 N 帧推理一次（对应上游的 UpdateEveryXFrames 节流）。
+    ///
+    /// 这里从 5 调到 2：5 帧意味着 mask 最多滞后 5 帧，人像快速移动时
+    /// 遮罩会明显落后于人（实测 IoU 只有 0.77），没被盖住的人像像素会被
+    /// 当成「背景稳定」而烤进历史缓冲，导致去遮挡留下残影。
+    /// 现在设成 1：配合 `isBusy` 自我节流，等于「跑满 ANE 能跟上的最快速度」，
+    /// 人像移动越快、遮罩越不该落后。
+    var frameInterval = 1
 
     private let lock = NSLock()
     private var latestMask: SegmentationMask?

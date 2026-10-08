@@ -53,6 +53,36 @@ final class SegmentationPostprocessStage: OffscreenRenderStage {
     }
 }
 
+// MARK: - 掩膜膨胀（对应上游 OpenCVDilateStage）
+
+/// 5×5 最大值滤波，把分割 mask 向外扩 2 像素。
+/// 上游用 OpenCV 的 `Imgproc.dilate`；这里用 Metal 片元着色器实现（决策 D5：不引入 OpenCV）。
+final class DilateStage: OffscreenRenderStage {
+    let name = "DilateMask"
+    let inputs: [TextureHandle]
+    let output: TextureHandle
+
+    private var resolution: SIMD2<Float>
+    private var radius: Float
+
+    init(input: TextureHandle, output: TextureHandle, radius: Float = 2) {
+        self.inputs = [input]
+        self.output = output
+        self.radius = radius
+        self.resolution = SIMD2<Float>(Float(output.spec.width), Float(output.spec.height))
+    }
+
+    func encode(_ ctx: FrameContext, encoder: MTLRenderCommandEncoder) throws {
+        let pipeline = try ctx.metal.renderPipelineState(vertex: "vs_quad",
+                                                        fragment: "fs_dilate_mask")
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setFragmentTexture(try ctx.texture(inputs[0]), index: 0)
+        encoder.setFragmentBytes(&resolution, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
+        encoder.setFragmentBytes(&radius, length: MemoryLayout<Float>.stride, index: 1)
+        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+    }
+}
+
 // MARK: - 时序累积（segmentation_accumulation_shader.glsl）
 
 /// 「背景稳定度」累积：被遮挡处清零、未遮挡处每帧 +factor。

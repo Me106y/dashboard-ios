@@ -73,3 +73,26 @@ fragment float4 fs_masking(QuadOut in [[stage_in]],
     float actual = step(1.0, m.x + m.y + m.z);
     return col2 * actual + (1.0 - actual) * col1;
 }
+
+// MARK: - 掩膜膨胀（5×5 最大值滤波）
+//
+// 对应上游 `OpenCVDilateStage`（`Imgproc.dilate`，kernel = 2*2+1 = 5×5 矩形，
+// `getStructuringElement(CV_SHAPE_RECT)`）。
+// 作用：把分割 mask 向外扩一圈，覆盖人像边缘，否则边缘像素不会被历史帧替换，
+// 去遮挡后的画面会留下一圈"人形轮廓"。
+
+fragment float4 fs_dilate_mask(QuadOut in [[stage_in]],
+                               texture2d<float> mask [[texture(0)]],
+                               constant float2 &resolution [[buffer(0)]],
+                               constant float &radius [[buffer(1)]]) {
+    float2 texel = 1.0 / resolution;
+    float maxValue = 0.0;
+    int r = int(radius);
+    for (int dy = -r; dy <= r; ++dy) {
+        for (int dx = -r; dx <= r; ++dx) {
+            float2 offset = float2(float(dx), float(dy)) * texel;
+            maxValue = max(maxValue, mask.sample(kSegSampler, in.uv + offset).r);
+        }
+    }
+    return float4(maxValue, maxValue, maxValue, 1.0);
+}

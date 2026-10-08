@@ -28,22 +28,43 @@ enum FrameCapture {
         let height = staging.height
         guard width > 0, height > 0 else { return false }
 
-        let bytesPerRow = width * 4
-        var bgra = [UInt8](repeating: 0, count: bytesPerRow * height)
-        bgra.withUnsafeMutableBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            staging.getBytes(base, bytesPerRow: bytesPerRow,
+        // 必须按纹理的实际像素格式决定每行字节数：
+        // r8Unorm 是每像素 1 字节，按 4 字节读会读到错位数据
+        // （表现为「抓出来的 mask 是一条窄竖条」，与真实内容完全不符）。
+        let isSingleChannel = staging.pixelFormat == .r8Unorm
+        let sourceBytesPerRow = isSingleChannel ? width : width * 4
+
+        var raw = [UInt8](repeating: 0, count: sourceBytesPerRow * height)
+        raw.withUnsafeMutableBytes { buffer in
+            guard let base = buffer.baseAddress else { return }
+            staging.getBytes(base, bytesPerRow: sourceBytesPerRow,
                              from: MTLRegionMake2D(0, 0, width, height),
                              mipmapLevel: 0)
         }
 
-        // BGRA -> RGBA
-        var rgba = bgra
-        for index in stride(from: 0, to: rgba.count, by: 4) {
-            rgba[index] = bgra[index + 2]
-            rgba[index + 2] = bgra[index]
-            rgba[index + 3] = 255
+        // 统一转成 RGBA
+        var rgba = [UInt8](repeating: 0, count: width * 4 * height)
+        if isSingleChannel {
+            for y in 0..<height {
+                for x in 0..<width {
+                    let v = raw[y * width + x]
+                    let dst = (y * width + x) * 4
+                    rgba[dst] = v; rgba[dst + 1] = v; rgba[dst + 2] = v; rgba[dst + 3] = 255
+                }
+            }
+        } else {
+            for y in 0..<height {
+                for x in 0..<width {
+                    let src = (y * width + x) * 4
+                    let dst = src
+                    rgba[dst] = raw[src + 2]       // BGRA -> RGBA
+                    rgba[dst + 1] = raw[src + 1]
+                    rgba[dst + 2] = raw[src]
+                    rgba[dst + 3] = 255
+                }
+            }
         }
+        let bytesPerRow = width * 4
 
         guard let provider = CGDataProvider(data: Data(rgba) as CFData),
               let image = CGImage(width: width,
