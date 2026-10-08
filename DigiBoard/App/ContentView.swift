@@ -74,15 +74,23 @@ struct ContentView: View {
 
     private var controlBar: some View {
         HStack(spacing: 12) {
-            // 主按钮：在离线视频与相机之间切换
-            Button {
-                model.toggleInput()
-            } label: {
-                Label(model.inputMode == .video ? "切换到相机" : "切换到视频测试",
-                      systemImage: model.inputMode == .video ? "camera" : "film")
+            // 主按钮：有相机时在「离线视频 ↔ 相机」之间切换；
+            // 没有相机（模拟器）时直接显示当前处于视频测试模式，避免出现一个点不动的按钮
+            if model.cameraAvailable {
+                Button {
+                    model.toggleInput()
+                } label: {
+                    Label(model.inputMode == .video ? "切换到相机" : "切换到视频测试",
+                          systemImage: model.inputMode == .video ? "camera" : "film")
+                }
+                .buttonStyle(.borderedProminent)
+            } else {
+                Label("视频测试模式（无相机）", systemImage: "film")
+                    .font(.caption.weight(.medium))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.tint.opacity(0.85), in: Capsule())
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(model.inputMode == .video && !model.cameraAvailable)
 
             // 用自备视频测试
             Button {
