@@ -20,11 +20,7 @@ final class BoardViewModel: ObservableObject {
     @Published private(set) var detectionMillis: Double = 0
     @Published private(set) var frameMillis: Double = 0
     @Published private(set) var detectionCount: Int = 0
-    @Published private(set) var mode: CornerTracker.Mode = .auto
-    @Published private(set) var debugViewIndex: Int = 0
-    @Published private(set) var debugViewCount: Int = 1
     @Published private(set) var cameraResolution: CGSize = .zero
-    @Published var showsOverlay: Bool = true
 
     private(set) var renderer: Renderer?
 
@@ -35,9 +31,6 @@ final class BoardViewModel: ObservableObject {
     private var pipeline: FullPipeline?
     private var cancellables = Set<AnyCancellable>()
     private var statsTimer: Timer?
-
-    private var touchStart: CGPoint?
-    private var lastTouchPoint: CGPoint?
 
     init() {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -114,18 +107,30 @@ final class BoardViewModel: ObservableObject {
             self.tracker = tracker
             self.pipeline = pipeline
             self.renderer = renderer
-            self.debugViewCount = pipeline.handles.debugSequence.count
-            // 调试用：DB_DEBUG_VIEW=<index> 可直接跳到某一级中间结果
+            // 开发期调试用：DB_DEBUG_VIEW=<index> 可直接跳到某一级中间结果
             if let raw = ProcessInfo.processInfo.environment["DB_DEBUG_VIEW"],
                let index = Int(raw) {
                 pipeline.present.select(index: index)
-                self.debugViewIndex = pipeline.present.selectedIndex
+                print("[P5] 调试视图 index=\(index) -> \(pipeline.present.current.name)")
             }
             self.status = .running
 
             let names = pipeline.handles.debugSequence.enumerated()
                 .map { "\($0.offset):\($0.element.name)" }
                 .joined(separator: " ")
+            // 调试期抓帧：DB_CAPTURE=<文件名>，默认在第 90 帧抓
+            if let fileName = ProcessInfo.processInfo.environment["DB_CAPTURE"],
+               let url = FrameCapture.makeURL(fileName: fileName) {
+                let delay = Int(ProcessInfo.processInfo.environment["DB_CAPTURE_FRAME"] ?? "") ?? 90
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(delay) / 30.0) {
+                    // 抓帧目标跟随当前调试视图，便于逐级比对
+                    renderer.captureRequest = Renderer.CaptureRequest(handle: pipeline.present.current,
+                                                                      url: url)
+                    print("[CAPTURE] 抓帧请求已下发：目标=\(pipeline.present.current.name) index=\(pipeline.present.selectedIndex)")
+                }
+                print("[CAPTURE] 将在第 \(delay) 帧抓取到 \(url.path)")
+            }
+
             print("[P2] 管线就绪：相机 \(Int(cameraSize.width))x\(Int(cameraSize.height))，"
                   + "分割输入 \(provider.inputWidth)x\(provider.inputHeight)，"
                   + "节点 \(pipeline.nodes.count)")
@@ -140,14 +145,26 @@ final class BoardViewModel: ObservableObject {
 
     private func startStatsPolling() {
         statsTimer?.invalidate()
+        var tick = 0
         statsTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self else { return }
+            tick += 1
+            // 真机上没有可见控制台，定期把关键指标打到日志里
+            if tick % 4 == 0 {
+                let seg = self.pipeline?.segmentation
+                let corner = self.pipeline?.cornerDetection
+                print(String(format: "[STAT] %.1ffps 帧%.1fms 分割%.0fms 前景%.1f%% 角点%.0fms %d条 %d次",
+                             self.fps, self.frameMillis,
+                             seg?.lastInferenceMillis ?? 0, (seg?.lastForegroundRatio ?? 0) * 100,
+                             corner?.lastDetectionMillis ?? 0,
+                             corner?.lastLineCount ?? 0,
+                             corner?.detectionCount ?? 0))
+            }
             self.fps = self.renderer?.stats.fps ?? 0
             self.frameMillis = self.renderer?.stats.lastFrameMillis ?? 0
             self.inferenceMillis = self.pipeline?.segmentation.lastInferenceMillis ?? 0
             self.detectionMillis = self.pipeline?.cornerDetection.lastDetectionMillis ?? 0
             self.detectionCount = self.pipeline?.cornerDetection.detectionCount ?? 0
-            self.debugViewIndex = self.pipeline?.present.selectedIndex ?? 0
         }
     }
 
@@ -158,80 +175,5 @@ final class BoardViewModel: ObservableObject {
             }
         }
         return nil
-    }
-
-    // MARK: - 交互（决策 D14）
-
-    func handleTouch(_ point: CGPoint, phase: CanvasTouchPhase, viewSize: CGSize) {
-        guard let tracker, cameraResolution.width > 0,
-              viewSize.width > 0, viewSize.height > 0 else { return }
-
-        switch phase {
-        case .began:
-            touchStart = point
-            lastTouchPoint = point
-            if let cameraPoint = cameraPoint(for: point, viewSize: viewSize) {
-                tracker.dragCorner(near: cameraPoint)
-            }
-        case .moved:
-            lastTouchPoint = point
-            if let cameraPoint = cameraPoint(for: point, viewSize: viewSize) {
-                tracker.dragCorner(near: cameraPoint)
-            }
-        case .ended:
-            defer { touchStart = nil; lastTouchPoint = nil }
-            guard let start = touchStart, let end = lastTouchPoint ?? Optional(point) else { break }
-            let moved = hypot(end.x - start.x, end.y - start.y)
-            if moved < 10 {
-                // 单击（位移小于阈值）才切换调试视图，避免上游"一碰就切换"的问题
-                cycleDebugView()
-            }
-        case .cancelled:
-            touchStart = nil
-            lastTouchPoint = nil
-        }
-
-        syncMode()
-    }
-
-    private func cameraPoint(for viewPoint: CGPoint, viewSize: CGSize) -> SIMD2<Float>? {
-        let rect = DisplayGeometry.fitRect(sourceSize: cameraResolution,
-                                           drawableSize: viewSize,
-                                           inset: 0.02)
-        let nx = viewPoint.x / viewSize.width
-        let ny = 1 - viewPoint.y / viewSize.height
-        let u = (nx - rect.minX) / rect.width
-        let v = (ny - rect.minY) / rect.height
-        guard u >= 0, u <= 1, v >= 0, v <= 1 else { return nil }
-        return SIMD2<Float>(Float(u) * Float(cameraResolution.width),
-                            Float(v) * Float(cameraResolution.height))
-    }
-
-    private func syncMode() {
-        if let tracker { mode = tracker.mode }
-    }
-
-    // MARK: - 控件
-
-    func toggleMode() {
-        guard let tracker else { return }
-        tracker.setMode(tracker.mode == .auto ? .manual : .auto)
-        syncMode()
-    }
-
-    func setMode(_ newMode: CornerTracker.Mode) {
-        tracker?.setMode(newMode)
-        syncMode()
-    }
-
-    func cycleDebugView() {
-        pipeline?.present.next()
-        debugViewIndex = pipeline?.present.selectedIndex ?? 0
-    }
-
-    func resetCorners() {
-        tracker?.resetManual(width: Float(cameraResolution.width),
-                             height: Float(cameraResolution.height))
-        print("[P5] 角点已重置")
     }
 }

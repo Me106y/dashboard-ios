@@ -22,12 +22,12 @@ final class PresentStage: DrawableRenderStage {
         self.inset = inset
     }
 
+    /// 仅供开发期用 `DB_DEBUG_VIEW` 环境变量指定要显示的中间结果；
+    /// 产品界面不再提供切换入口。
     func select(index newIndex: Int) {
         guard !selectable.isEmpty else { return }
         index = ((newIndex % selectable.count) + selectable.count) % selectable.count
     }
-
-    func next() { select(index: index + 1) }
 
     var selectedIndex: Int { index }
 

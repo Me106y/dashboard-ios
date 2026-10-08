@@ -113,30 +113,3 @@ fragment float4 fs_corner(HandleVertexOut in [[stage_in]]) {
     }
     return float4(0.0, 1.0, 0.0, 1.0);
 }
-
-// MARK: - 线段（用于绘制角点连成的四边形边框）
-
-struct SegmentParams {
-    float2 a;            // NDC
-    float2 b;            // NDC
-    float2 resolution;   // drawable 像素尺寸，用于把线宽换算成 NDC
-    float thickness;     // 线宽（像素）
-};
-
-vertex QuadOut vs_segment(uint vid [[vertex_id]],
-                          constant SegmentParams &p [[buffer(0)]]) {
-    float2 dir = p.b - p.a;
-    float len = length(dir);
-    if (len < 1e-6) { dir = float2(1.0, 0.0); }
-    float2 n = normalize(dir);
-    float2 perp = float2(-n.y, n.x) * (p.thickness / p.resolution) * 2.0;
-
-    float t = float(vid & 1u);
-    float s = float(vid >> 1u) * 2.0 - 1.0;
-    float2 pos = mix(p.a, p.b, t) + perp * s;
-
-    QuadOut o;
-    o.position = float4(pos, 0.0, 1.0);
-    o.uv = float2(t, s * 0.5 + 0.5);
-    return o;
-}

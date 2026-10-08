@@ -32,8 +32,10 @@ final class CameraFrameSource: NSObject, ObservableObject {
     /// CVMetalTexture 必须保活，否则 MTLTexture 会失效
     private var retainedTexture: CVMetalTexture?
 
-    /// 视频旋转角：横屏使用 90°（后摄传感器相对竖屏旋转 90°）
-    var videoRotationAngle: CGFloat = 90
+    /// 视频旋转角。App 锁定横屏，因此这里取 0°：后摄原生缓冲区即为
+    /// 1920×1080 的横向画幅；取 90° 会得到 1080×1920 的竖向缓冲区，
+    /// 与横屏画布不匹配（旋转交给 AVCaptureConnection，而不是着色器）。
+    var videoRotationAngle: CGFloat = 0
 
     init(device: MTLDevice) {
         super.init()

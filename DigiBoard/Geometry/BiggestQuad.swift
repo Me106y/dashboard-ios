@@ -26,6 +26,14 @@ enum BiggestQuadFinder {
                               let p4 = horizontal[j].intersect(vertical[l]) else { continue }
 
                         let quad = makeConvex(Quad(a: p1, b: p2, c: p3, d: p4))
+
+                        // **相对上游的修正**：上游是「先取面积最大、再看它是否合理」，
+                        // 不合理就整帧放弃（源码里也写明了这个 LIMITATION）。
+                        // 实测在真实场景下这会导致 0 检出率——因为直线被延长到 2000px，
+                        // 大面积的组合往往是离谱的四边形，把合理的那个挤掉了。
+                        // 这里改成：只在「角度合理」的候选里取面积最大者。
+                        guard isReasonable(quad) else { continue }
+
                         let area = quad.area
                         if area > biggestArea {
                             biggestArea = area
@@ -36,10 +44,8 @@ enum BiggestQuadFinder {
             }
         }
 
-        guard let rawQuad = biggest, biggestArea > 0 else { return nil }
-        // 与上游一致：先判断是否"合理"，再重排角点顺序
-        guard isReasonable(rawQuad) else { return nil }
-        return fixup(rawQuad).points
+        guard let quad = biggest, biggestArea > 0 else { return nil }
+        return fixup(quad).points
     }
 
     /// 角点角度必须落在 60°~130°（对应上游 isQuadReasonable）

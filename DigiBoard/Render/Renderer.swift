@@ -21,6 +21,18 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var persistentTextures: [TextureHandle: MTLTexture] = [:]
     private var logFrames = 0
 
+    /// 调试期抓帧：抓一帧指定句柄的纹理到指定路径后自动关闭
+    struct CaptureRequest {
+        let handle: TextureHandle
+        let url: URL
+    }
+    var captureRequest: CaptureRequest?
+    private var captureDone = false
+    /// 抓帧暂存：帧内 blit 到这里，完成回调再异步回读，
+    /// 这样即使目标纹理是「本帧用完就回收」的也可以抓。
+    private var captureStaging: MTLTexture?
+    private var captureURL: URL?
+
     init?(nodes: [PipelineNode]) {
         guard let metal = MetalContext() else { return nil }
         self.metal = metal
@@ -126,6 +138,30 @@ final class Renderer: NSObject, MTKViewDelegate {
             encoder.endEncoding()
         }
 
+        // 3.5) 调试期抓帧：在帧内把目标纹理拷到 shared 暂存纹理
+        if let request = captureRequest, !captureDone,
+           let source = try? ctx.texture(request.handle) {
+            captureDone = true
+            captureURL = request.url
+
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: source.pixelFormat,
+                                                                      width: source.width,
+                                                                      height: source.height,
+                                                                      mipmapped: false)
+            descriptor.storageMode = .shared
+            descriptor.usage = [.shaderRead, .renderTarget]
+            captureStaging = metal.device.makeTexture(descriptor: descriptor)
+
+            if let staging = captureStaging, let blit = commandBuffer.makeBlitCommandEncoder() {
+                blit.copy(from: source, sourceSlice: 0, sourceLevel: 0,
+                          sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                          sourceSize: MTLSize(width: source.width, height: source.height, depth: 1),
+                          to: staging, destinationSlice: 0, destinationLevel: 0,
+                          destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                blit.endEncoding()
+            }
+        }
+
         // 4) 非 persistent 纹理在 GPU 用完之后才归还池中，
         //    否则会和仍在 in-flight 的命令缓冲抢同一张纹理。
         // 需要在 GPU 完成后回读的纹理（边缘图 / 分割输入）
@@ -163,6 +199,18 @@ final class Renderer: NSObject, MTKViewDelegate {
 
             for (spec, texture) in recyclables {
                 self.metal.texturePool.recycle(spec, texture)
+            }
+
+            // 调试期抓帧（只在指定帧做一次）
+            if let staging = self.captureStaging, let url = self.captureURL {
+                self.captureStaging = nil
+                self.captureURL = nil
+                // 绝不在这里同步等待：完成回调跑在 Metal 内部线程，
+                // 再建命令缓冲 + waitUntilCompleted 会死锁。
+                DispatchQueue.global(qos: .utility).async {
+                    let ok = FrameCapture.write(staging: staging, to: url)
+                    print("[CAPTURE] \(ok ? "已写出" : "写出失败") \(url.path)")
+                }
             }
             self.stats.record(gpuSeconds: buffer.gpuEndTime - buffer.gpuStartTime,
                               cpuSeconds: cpuSeconds)

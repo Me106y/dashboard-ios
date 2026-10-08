@@ -132,6 +132,9 @@ final class CornerDetectionStage: TextureConsumer {
     var frameInterval = 10
     private var frameCounter = 0
 
+    private let workQueue = DispatchQueue(label: "com.zhuanz.digiboard.corner", qos: .userInitiated)
+    private var isBusy = false
+
     private(set) var lastDetectionMillis: Double = 0
     private(set) var lastLineCount = 0
     private(set) var detectionCount = 0
@@ -149,6 +152,11 @@ final class CornerDetectionStage: TextureConsumer {
         // 否则一条直线都投不出来。
         var adjusted = parameters ?? .upstreamDefault
         adjusted.threshold = max(Int(150.0 / Double(max(scaleToSource, 1))), 25)
+        // 上游 maxLines = 50，但最大四边形是 n²m² 的四重循环：
+        // 50 条直线分成两组后约 39 万次迭代（真机实测 300ms+）。
+        // 压到 20 条（约 1 万次迭代）后仍在毫秒级，且霍夫本身按票数排序，
+        // 保留的就是最强的那些直线。
+        adjusted.maxLines = 20
         self.detectorParams = adjusted
     }
 
@@ -156,9 +164,21 @@ final class CornerDetectionStage: TextureConsumer {
         frameCounter += 1
         guard frameCounter % max(frameInterval, 1) == 0 else { return }
         guard bytesPerRow == width * 4 else { return }
+        guard !isBusy else { return }
 
-        let start = CACurrentMediaTime()
+        // 这份缓冲区随帧复用，必须立刻拷走；重活放到后台队列，
+        // 否则霍夫 + 四边形搜索会堵住渲染线程的完成回调（真机实测掉到 17fps）。
         let pixels = [UInt8](bytes)
+        isBusy = true
+        workQueue.async { [weak self] in
+            guard let self else { return }
+            self.detect(pixels: pixels, width: width, height: height)
+            self.isBusy = false
+        }
+    }
+
+    private func detect(pixels: [UInt8], width: Int, height: Int) {
+        let start = CACurrentMediaTime()
 
         let lines = HoughLineDetector.detect(edges: pixels,
                                              width: width,
@@ -187,9 +207,6 @@ final class CornerDetectionStage: TextureConsumer {
                 let text = scaled.map { String(format: "(%.0f,%.0f)", $0.x, $0.y) }.joined(separator: " ")
                 print("[P3] 检测到白板四角 \(text)")
             }
-        }
-        if detectionCount == 0 && frameCounter <= frameInterval {
-            print("[P3] 未找到合理四边形（可能角度校验未通过）")
         }
         lastDetectionMillis = (CACurrentMediaTime() - start) * 1000
     }

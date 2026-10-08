@@ -145,7 +145,5 @@ final class GeometryTests: XCTestCase {
                        "GaussianParams 必须与 Filters.metal 的 6×float + 2×float2 对齐")
         XCTAssertEqual(MemoryLayout<CannyParams>.size, 16,
                        "CannyParams 必须与 Filters.metal 的 2×float + float2 对齐")
-        XCTAssertEqual(MemoryLayout<SegmentParams>.size, 28,
-                       "SegmentParams 必须与 Blit.metal 的 2×float2 + float2 + float 对齐")
     }
 }

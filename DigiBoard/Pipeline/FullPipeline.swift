@@ -38,7 +38,6 @@ struct FullPipeline {
     let nodes: [PipelineNode]
     let handles: PipelineHandles
     let present: PresentStage
-    let overlay: CornerOverlayStage
     let segmentation: SegmentationStage
     let cornerDetection: CornerDetectionStage
 }
@@ -91,7 +90,7 @@ enum PipelineBuilder {
         let grayFull = TextureHandle("enhance.grayFull", rgba(width, height))
         let binarized = TextureHandle("enhance.binarized", rgba(width, height))
         let saturated = TextureHandle("enhance.saturated", rgba(width, height))
-        let final = TextureHandle("enhance.final", rgba(width, height))
+        let final = TextureHandle("enhance.final", rgba(width, height, persistent: true))
 
         var nodes: [PipelineNode] = []
 
@@ -137,7 +136,7 @@ enum PipelineBuilder {
         nodes.append(SaturateStage(input: whitebalanced, output: saturated, gain: 4.5))
         nodes.append(makeColorAddStage(colours: saturated, binarized: binarized, output: final))
 
-        // ── 输出：上屏 + 角点手柄
+        // ── 输出：上屏
         let handles = PipelineHandles(camera: camera, segmentInput: segmentInput, mask: mask,
                                       accumulatorA: accA, accumulatorB: accB, maskPost: maskPost,
                                       cleaned: cleaned, stored: stored,
@@ -151,11 +150,8 @@ enum PipelineBuilder {
         let present = PresentStage(selectable: handles.debugSequence, sourceSize: cameraSize)
         nodes.append(present)
 
-        let overlay = CornerOverlayStage(tracker: tracker, sourceSize: cameraSize)
-        nodes.append(overlay)
-
         return FullPipeline(nodes: nodes, handles: handles, present: present,
-                            overlay: overlay, segmentation: segmentation,
+                            segmentation: segmentation,
                             cornerDetection: cornerDetection)
     }
 }

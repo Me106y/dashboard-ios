@@ -31,7 +31,7 @@ final class PerspectiveStage: OffscreenRenderStage {
         if prepareLogCount < 3 {
             prepareLogCount += 1
             let text = corners.map { String(format: "(%.0f,%.0f)", $0.x, $0.y) }.joined(separator: " ")
-            print("[P3] Perspective 使用角点 \(text)  模式=\(tracker.mode.rawValue)")
+            print("[P3] Perspective 使用角点 \(text)")
         }
 
         // 角点（图像像素，y 向下）-> 源 uv
