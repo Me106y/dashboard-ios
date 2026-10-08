@@ -26,7 +26,7 @@ import subprocess
 
 import numpy as np
 import onnxruntime as ort
-from PIL import Image
+from PIL import Image, ImageDraw
 
 HERE = pathlib.Path(__file__).resolve().parent
 FIXTURES = HERE / "fixtures"
@@ -70,9 +70,39 @@ def main() -> None:
     person = person.crop((max(xs.min() - pad, 0), max(ys.min() - pad, 0),
                           min(xs.max() + pad, person.width), min(ys.max() + pad, person.height)))
 
-    # 2) 静止白板背景（也是验证去遮挡时的真值）
+    # 2) 静止白板背景 + 深色笔迹（也是验证去遮挡时的真值）
+    #
+    # 为什么要画字：增强链里的白平衡本质是**高通滤波**（只保留"比局部均值更暗"的内容）。
+    # 如果白板是空的，输出当然是一片白、看不出任何效果；真实使用场景是
+    # "白底 + 深色马克笔字"，所以测试素材必须包含笔迹才有验证价值。
     background = Image.open(SRC / "whiteboard.jpg").convert("RGB").resize((OUT_W, OUT_H), Image.LANCZOS)
+    draw = ImageDraw.Draw(background)
+    ink = (38, 42, 48)
+
+    # 标题行
+    draw.line([(90, 96), (430, 96)], fill=ink, width=13)
+    # 正文若干行（长短不一的"字"）
+    for row, width in enumerate([620, 700, 560, 660, 470]):
+        y = 190 + row * 62
+        x = 90
+        remaining = width
+        while remaining > 40:
+            seg = min(remaining, 150)
+            draw.line([(x, y), (x + seg, y)], fill=ink, width=11)
+            x += seg + 34
+            remaining -= seg + 34
+
+    # 右侧一个简单示意图（方框 + 箭头 + 标注线）
+    draw.rectangle([860, 180, 1180, 430], outline=ink, width=10)
+    draw.line([(1020, 430), (1020, 520)], fill=ink, width=10)
+    draw.polygon([(990, 500), (1050, 500), (1020, 545)], fill=ink)
+    draw.line([(860, 300), (780, 300)], fill=ink, width=10)
+    draw.line([(1180, 300), (1255, 300)], fill=ink, width=10)
+    # 底部一条长横线
+    draw.line([(90, 620), (1200, 620)], fill=ink, width=14)
+
     background.save(FIXTURES / "whiteboard_bg.jpg", quality=90)
+    print("已在白板背景上绘制测试笔迹")
 
     # 3) 逐帧合成
     person_h = int(OUT_H * 0.78)
