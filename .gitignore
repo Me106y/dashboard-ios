@@ -12,14 +12,10 @@ xcuserdata/
 *.ipa
 *.dSYM.zip
 
-# 模型转换中间产物（保留最终 .mlpackage）
-scripts/**/*.onnx
-scripts/**/__pycache__/
-scripts/**/.venv/
-*.pdmodel
-*.pdiparams
-*.pdiparams.info
-
-# Python
+# Python / 模型转换
+scripts/.venv/
 __pycache__/
-.venv/
+*.pyc
+# 中间产物可重新生成，不入库；最终 .mlpackage 入库（App 需要）
+scripts/model-convert/output/*.onnx
+scripts/model-convert/output/*.mlmodel

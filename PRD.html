@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DigiBoard iOS — 产品与移植文档 v0.1</title>
+  <title>DigiBoard iOS — 产品与移植文档 v0.2</title>
   <link rel="stylesheet" href="prd-styles.css">
 </head>
 <body>
@@ -36,6 +36,7 @@
         <a href="#nfr">非功能需求</a>
         <a href="#risks">风险与阻塞</a>
         <a href="#structure">工程结构</a>
+        <a href="#p0">P0 转换实录</a>
         <a href="#changelog">变更记录</a>
       </nav>
       <div class="sidebar-note">
@@ -51,8 +52,8 @@
           <h1>DigiBoard iOS</h1>
           <p class="hero-lead">相机取景 → 人像分割 → 时序背景重建（去遮挡）→ 透视校正 → 图像增强 → 全屏显示。</p>
           <div class="meta-row" aria-label="文档元数据">
-            <span>版本 0.1</span>
-            <span>状态：方案已定稿 · 待开工 P0</span>
+            <span>版本 0.2</span>
+            <span>状态：P0 已完成 · 进入 P1</span>
             <span>更新：2026-10-08</span>
           </div>
         </div>
@@ -66,8 +67,8 @@
             <span>个着色器移植</span>
           </div>
           <div>
-            <strong>6</strong>
-            <span>期交付（P0–P5）</span>
+            <strong>0.07<span style="font-size:.6em">%</span></strong>
+            <span>ONNX↔Core ML 像素差</span>
           </div>
         </div>
       </section>
@@ -427,6 +428,7 @@
                 <tr><td><strong>验收</strong></td><td><strong>视觉验收</strong>：喂测试图，Core ML 输出的 mask 能合理抠出人像轮廓</td></tr>
                 <tr><td>备用诊断</td><td>若视觉异常，启用 <code>paddlepaddle</code> 全精度参考链路，逐像素比对定位算子问题</td></tr>
                 <tr><td>硬性指标</td><td>无阈值门槛（原「1% 不一致 / IoU 0.98」已降级为诊断参考）</td></tr>
+                <tr><td><strong>结果</strong></td><td>✅ <strong>已完成</strong>：Core ML 模型 1.9 MB；ONNX↔Core ML 不一致像素 <strong>0.073%</strong>、前景 <strong>IoU 0.9926</strong>（详见「P0 转换实录」）</td></tr>
               </tbody>
             </table>
           </div>
@@ -635,6 +637,74 @@
         </div>
       </section>
 
+
+      <section class="doc-section" id="p0">
+        <div class="section-heading">
+          <h2>P0 转换实录</h2>
+          <p>P0 是本次移植技术风险最高的一步。过程与结论记录在此，避免重复踩坑。</p>
+        </div>
+
+        <div class="callout" aria-label="P0 结论">
+          <div>
+            <span class="callout-label">P0 结论</span>
+            <h2>模型转换链路已打通并逐像素验证</h2>
+          </div>
+          <p>最终链路：<code>pdmodel+pdiparams</code> →（paddle2onnx 1.3.1 / paddlepaddle 2.6.2 + 图修复）→ <code>ONNX</code> <code>[1,3,144,256] f32 → [1,144,256] i32</code> →（onnx2torch → torch.jit.trace）→ TorchScript →（coremltools 8.1，mlProgram / iOS 17+ / FLOAT16）→ <code>.mlpackage</code> 图像输入 256×144 RGB，输出 <code>mask</code> <code>[1,144,256] INT32</code>，<strong>1.9 MB</strong>。</p>
+        </div>
+
+        <article class="gate-spec">
+          <header>
+            <div>
+              <span class="gate-number">R1</span>
+              <h3>六个实际卡点</h3>
+            </div>
+            <span class="enforcement-badge">已全部解决</span>
+          </header>
+          <div class="table-wrap compact">
+            <table>
+              <thead>
+                <tr><th>#</th><th>卡点</th><th>根因</th><th>解法</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>1</td><td>ONNX 加载失败</td><td>ASPP 的 <code>AdaptiveAvgPool</code> 在动态输入下无法推导 kernel，导出 <code>kernel_shape=[-1,-1]</code></td><td>钉死输入形状，按 Paddle 语义换算成等价固定核</td></tr>
+                <tr><td>2</td><td>Paddle 3.x 读不了模型</td><td><code>load_inference_model</code> 走 PIR 分支，<code>UnicodeDecodeError</code></td><td>锁定 paddlepaddle <strong>2.6.2</strong></td></tr>
+                <tr><td>3</td><td>没有 ONNX→Core ML 通道</td><td>coremltools 自 <strong>7.0</strong> 移除 ONNX 前端；7.2 在本机原生库还加载失败</td><td>走官方路线：ONNX → PyTorch → TorchScript → Core ML</td></tr>
+                <tr><td>4</td><td>onnx2torch <code>KeyError</code></td><td>paddle2onnx 把 414 个权重内联成 <code>Constant</code> 节点</td><td>常量提升：<code>Constant</code> → <code>initializer</code></td></tr>
+                <tr><td>5</td><td><code>SAME_UPPER</code> 不支持</td><td>onnx2torch 未实现自动填充</td><td>形状已固定，把 19 个 <code>SAME_*</code> 展开成显式 <code>pads</code>；形状推导必须开 <code>data_prop=True</code></td></tr>
+                <tr><td>6</td><td>Core ML 图像预处理报错</td><td><code>scale</code> 需标量、<code>bias</code> 需三元组（pass 内部会 reshape 成 <code>[1,3,1,1]</code>）</td><td>按各自要求传参</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="gate-spec">
+          <header>
+            <div>
+              <span class="gate-number">R2</span>
+              <h3>验证结果</h3>
+            </div>
+            <span class="enforcement-badge">通过</span>
+          </header>
+          <p>测试图 <code>infront.jpg</code>（4032×1908，人在白板前）：</p>
+          <div class="table-wrap compact">
+            <table>
+              <thead>
+                <tr><th>指标</th><th>ONNX</th><th>Core ML</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>前景占比</td><td>9.9%</td><td>9.8%</td></tr>
+                <tr><td>前景包围盒</td><td><code>x[122,190] y[31,143]</code></td><td><code>x[122,190] y[31,143]</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>一致性：不一致像素 <strong>0.073%</strong>，前景 <strong>IoU 0.9926</strong>。比原定的数值闸门（≤1% 不一致 / IoU ≥0.98）更严，且已满足；尽管验收已降级为视觉验收，实测数据顺带把数值门槛也一并过了。</p>
+          <div class="spec-note">
+            <strong>归一化已编进模型</strong>
+            <p><code>x' = (x/255 - 0.5) / 0.5</code> 已编入 Core ML 的 <code>ImageType</code>（<code>scale=1/127.5</code>、<code>bias=-1.0</code>）。<strong>App 直接喂 0–255 的 RGB 图像即可，不要重复归一化。</strong>产物与脚本见 <code>scripts/model-convert/</code>。</p>
+          </div>
+        </article>
+      </section>
+
       <section class="doc-section" id="changelog">
         <div class="section-heading">
           <h2>变更记录</h2>
@@ -647,6 +717,11 @@
               <tr><th>版本</th><th>日期</th><th>说明</th></tr>
             </thead>
             <tbody>
+              <tr>
+                <td>v0.2</td>
+                <td>2026-10-08</td>
+                <td><strong>P0 完成</strong>：pdmodel→ONNX→Core ML 全链路打通，模型 1.9 MB，ONNX↔Core ML 不一致像素 0.073% / 前景 IoU 0.9926；记录 6 个转换卡点与解法；新增 <code>scripts/model-convert/</code> 工具链与说明</td>
+              </tr>
               <tr>
                 <td>v0.1</td>
                 <td>2026-10-08</td>
@@ -663,11 +738,11 @@
           </div>
           <div>
             <strong>审核状态</strong>
-            <span>方案已定稿，待开工 P0</span>
+            <span>P0 已完成，进入 P1</span>
           </div>
           <div>
             <strong>下次更新</strong>
-            <span>P0 模型转换完成并视觉验收后</span>
+            <span>P1 渲染骨架完成、真机同屏显示原图与 mask 后</span>
           </div>
         </div>
       </section>
@@ -677,7 +752,7 @@
   <button class="back-to-top" id="back-to-top" aria-label="回到顶部">↑</button>
 
   <footer>
-    <p>DigiBoard · iOS 版 · 产品与移植文档 v0.1</p>
+    <p>DigiBoard · iOS 版 · 产品与移植文档 v0.2</p>
     <p>2026-10-08</p>
   </footer>
 

@@ -1,6 +1,6 @@
 # DigiBoard iOS — 产品与移植文档
 
-> 版本 **0.1** · 状态：**方案已定稿，待开工 P0** · 更新：2026-10-08
+> 版本 **0.2** · 状态：**P0 已完成（模型转换通过）· 进入 P1** · 更新：2026-10-08
 >
 > 本文档是 DigiBoard iOS 版的唯一事实来源：记录上游 Android 版盘点结论、14 项架构决策、
 > 管线与着色器映射、分期验收标准、风险与工程结构。
@@ -194,6 +194,7 @@
 | 验收 | **视觉验收**：喂测试图，Core ML 输出的 mask 能合理抠出人像轮廓 |
 | 备用诊断 | 若视觉异常，再启用 `paddlepaddle` 全精度参考链路，逐像素比对定位算子问题 |
 | 硬性指标 | 无阈值门槛（原 1% 不一致 / IoU 0.98 阈值已降级为诊断参考） |
+| **结果** | ✅ **已完成**。Core ML 模型 1.9 MB；ONNX↔Core ML 不一致像素 **0.073%**、前景 **IoU 0.9926**（详见 §12） |
 
 ### P1 · 渲染骨架
 
@@ -288,10 +289,61 @@
 
 ---
 
+## 12. P0 转换实录
+
+P0 是本次移植技术风险最高的一步，过程与结论记录在此，避免重复踩坑。
+
+### 12.1 最终链路
+
+```
+model.pdmodel + model.pdiparams           (PaddleSeg PP-HumanSegV2 portrait)
+      │  paddle2onnx 1.3.1 / paddlepaddle 2.6.2 + 图修复
+      ▼
+humansegv2portrait.onnx                   [1,3,144,256] f32 → [1,144,256] i32
+      │  onnx2torch → torch.jit.trace
+      ▼
+TorchScript
+      │  coremltools 8.1（mlProgram, iOS 17+, FLOAT16）
+      ▼
+humansegv2portrait.mlpackage              图像输入 256x144 RGB → mask [1,144,256] INT32，1.9 MB
+```
+
+### 12.2 六个实际卡点
+
+| # | 卡点 | 根因 | 解法 |
+| --- | --- | --- | --- |
+| 1 | ONNX 加载失败 | ASPP 的 `AdaptiveAvgPool` 在动态输入下无法推导 kernel，导出 `kernel_shape=[-1,-1]` | 钉死输入形状，按 Paddle 语义换算成等价固定核 |
+| 2 | Paddle 3.x 读不了模型 | `load_inference_model` 走 PIR 分支，`UnicodeDecodeError` | 锁定 paddlepaddle **2.6.2** |
+| 3 | 没有 ONNX→Core ML 通道 | coremltools 自 **7.0** 移除 ONNX 前端；7.2 在本机原生库还加载失败 | 走官方路线：ONNX → PyTorch → TorchScript → Core ML |
+| 4 | onnx2torch `KeyError` | paddle2onnx 把 414 个权重内联成 `Constant` 节点 | 常量提升：`Constant` → `initializer` |
+| 5 | `SAME_UPPER` 不支持 | onnx2torch 未实现自动填充 | 形状已固定，把 19 个 `SAME_*` 展开成显式 `pads`；形状推导必须开 `data_prop=True` |
+| 6 | Core ML 图像预处理报错 | `scale` 需标量、`bias` 需三元组（pass 内部会 reshape 成 `[1,3,1,1]`） | 按各自要求传参 |
+
+### 12.3 验证结果
+
+测试图 `infront.jpg`（4032×1908，人在白板前）：
+
+| 指标 | ONNX | Core ML |
+| --- | --- | --- |
+| 前景占比 | 9.9% | 9.8% |
+| 前景包围盒 | x[122,190] y[31,143] | x[122,190] y[31,143] |
+
+**一致性：不一致像素 0.073%，前景 IoU 0.9926。**
+—— 比原定的数值闸门（≤1% 不一致 / IoU ≥ 0.98）更严，且已满足；尽管 Q12 把闸门降级为视觉验收，
+实测数据顺带把数值门槛也一并过了。
+
+> 归一化 `x' = (x/255 - 0.5) / 0.5` 已编入 Core ML 的 `ImageType`（`scale=1/127.5`、`bias=-1.0`），
+> **App 直接喂 0–255 的 RGB 图像即可，不要重复归一化。**
+> 判据与产物细节见 `scripts/model-convert/README.md`。
+
+
+---
+
 ## 11. 变更记录
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
+| v0.2 | 2026-10-08 | **P0 完成**：pdmodel→ONNX→Core ML 全链路打通，模型 1.9 MB，ONNX↔Core ML 不一致像素 0.073% / 前景 IoU 0.9926；记录 6 个转换卡点与解法（见 §12）；新增 `scripts/model-convert/` 工具链与说明 |
 | v0.1 | 2026-10-08 | 初始版本。完成上游 Android 版盘点（96 文件 / 28 着色器 / 模型归属确认 / 7 项缺陷发现），确定 D1–D14 架构决策、管线与着色器映射、P0–P5 分期与验收标准 |
 
 ---
