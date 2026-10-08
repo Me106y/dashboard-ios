@@ -79,6 +79,12 @@ final class BoardViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
+        // 调试用：DB_SOURCE=video 强制走离线视频（真机默认是相机）
+        if ProcessInfo.processInfo.environment["DB_SOURCE"] == "video" {
+            switchToVideo()
+            return
+        }
+
         // 调试用：DB_SOURCE=still 用静态图当输入（用于几何对齐验证，不受视频时间差干扰）
         if ProcessInfo.processInfo.environment["DB_SOURCE"] == "still",
            let still = StillImageFrameSource(device: device, resourceName: "still_sample") {
