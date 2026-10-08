@@ -1,6 +1,6 @@
 # DigiBoard iOS — 产品与移植文档
 
-> 版本 **0.2** · 状态：**P0 已完成（模型转换通过）· 进入 P1** · 更新：2026-10-08
+> 版本 **0.3** · 状态：**P1 已完成（渲染骨架 + 静态图分割上屏）· 进入 P2** · 更新：2026-10-08
 >
 > 本文档是 DigiBoard iOS 版的唯一事实来源：记录上游 Android 版盘点结论、14 项架构决策、
 > 管线与着色器映射、分期验收标准、风险与工程结构。
@@ -339,10 +339,58 @@ humansegv2portrait.mlpackage              图像输入 256x144 RGB → mask [1,1
 
 ---
 
+## 13. P1 实施记录
+
+### 13.1 已落地的结构
+
+```
+DigiBoard/
+├── App/            DigiBoardApp / ContentView / MetalCanvasView / BoardViewModel
+├── Render/         MetalContext · TexturePool · TextureHandle · RenderStage · Renderer
+├── Pipeline/       StillImageStage · SegmentationStage · BlitStage
+├── Segmentation/   SegmentationProvider 协议 · CoreMLSegmentationProvider
+└── Shaders/        Blit.metal（blit_vertex / blit_fragment / blit_fragment_gray）
+```
+
+- 工程用**同步文件夹**（决策 D12）：新增源文件无需改 `project.pbxproj`，实测有效。
+- `.mlpackage` 被 Xcode 自动编译为 `humansegv2portrait.mlmodelc` 并随包；代码同时兼容
+  `mlmodelc` / `mlpackage` 两种形态。
+- `RenderStage`（GPU 阶段，可输出到纹理或 drawable）与 `TextureProducer`（CPU 生产者）
+  拆分；公共 `outputHandle` 统一取句柄。
+
+### 13.2 实施中修掉的四个问题
+
+| # | 问题 | 根因 | 解法 |
+| --- | --- | --- | --- |
+| 1 | Metal 编译报 `cannot execute tool 'metal'` | Xcode 26 起 Metal 工具链需单独下载 | `xcodebuild -downloadComponent MetalToolchain`（约 700 MB） |
+| 2 | **画面从第 2 帧起全黑** | `FrameContext` 每帧新建，persistent 纹理每帧都从池里拿到**新空纹理**，而 producer 的 dirty 标志已清不再重传 | Renderer 持有 `persistentTextures[handle]`，跨帧复用同一张纹理 |
+| 3 | 纹理回收与 in-flight 命令缓冲竞争 | 帧尾立刻把纹理还池，GPU 可能还在用 | 回收移入 `addCompletedHandler` |
+| 4 | mask 显示成**红色** | `r8Unorm` 采样得到 `(r,0,0,1)`，直接输出只有红通道有值 | 新增 `blit_fragment_gray` 复制 r 通道（对齐上游 `segment_postprocess_shader.glsl` 的 `.xxx`） |
+
+另有一处协议设计修正：`PipelineNode.output`（可选，nil=drawable）与
+`TextureProducer.output`（非可选）类型冲突，改为在子协议中各声明、用 `outputHandle` 统一取用。
+
+### 13.3 验证
+
+| 项 | 结果 |
+| --- | --- |
+| 模拟器编译 / 运行 | ✅ |
+| 真机 arm64 编译 | ✅（`-sdk iphoneos`，未签名） |
+| Core ML 加载 | ✅ `humansegv2portrait.mlmodelc`，输入 256×144 |
+| 分割耗时（模拟器 CPU） | 81.3 ms |
+| mask 前景占比 | **9.9%**，与 Python 侧 ONNX/Core ML 完全一致 |
+| 屏幕输出 | 左半原图（均值 165.9）、右半 mask（人像剪影，灰度三通道均值 22.3/23.1/24.7） |
+
+> 真机（iPhone 16）部署时设备处于 unavailable 离线状态，待连线后补部署验证。
+
+
+---
+
 ## 11. 变更记录
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
+| v0.3 | 2026-10-08 | **P1 完成**：手写同步文件夹工程 + Metal 渲染骨架（MetalContext/TexturePool/RenderStage/Renderer）+ Core ML 分割阶段 + 静态图与原图同屏；修掉 4 个实施问题（Metal 工具链、持久纹理每帧重分配导致黑屏、纹理回收竞争、r8Unorm 显示成红色）；真机 arm64 编译通过 |
 | v0.2 | 2026-10-08 | **P0 完成**：pdmodel→ONNX→Core ML 全链路打通，模型 1.9 MB，ONNX↔Core ML 不一致像素 0.073% / 前景 IoU 0.9926；记录 6 个转换卡点与解法（见 §12）；新增 `scripts/model-convert/` 工具链与说明 |
 | v0.1 | 2026-10-08 | 初始版本。完成上游 Android 版盘点（96 文件 / 28 着色器 / 模型归属确认 / 7 项缺陷发现），确定 D1–D14 架构决策、管线与着色器映射、P0–P5 分期与验收标准 |
 

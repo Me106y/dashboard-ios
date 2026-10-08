@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DigiBoard iOS — 产品与移植文档 v0.2</title>
+  <title>DigiBoard iOS — 产品与移植文档 v0.3</title>
   <link rel="stylesheet" href="prd-styles.css">
 </head>
 <body>
@@ -37,6 +37,7 @@
         <a href="#risks">风险与阻塞</a>
         <a href="#structure">工程结构</a>
         <a href="#p0">P0 转换实录</a>
+        <a href="#p1">P1 实施记录</a>
         <a href="#changelog">变更记录</a>
       </nav>
       <div class="sidebar-note">
@@ -52,8 +53,8 @@
           <h1>DigiBoard iOS</h1>
           <p class="hero-lead">相机取景 → 人像分割 → 时序背景重建（去遮挡）→ 透视校正 → 图像增强 → 全屏显示。</p>
           <div class="meta-row" aria-label="文档元数据">
-            <span>版本 0.2</span>
-            <span>状态：P0 已完成 · 进入 P1</span>
+            <span>版本 0.3</span>
+            <span>状态：P1 已完成 · 进入 P2</span>
             <span>更新：2026-10-08</span>
           </div>
         </div>
@@ -69,6 +70,10 @@
           <div>
             <strong>0.07<span style="font-size:.6em">%</span></strong>
             <span>ONNX↔Core ML 像素差</span>
+          </div>
+          <div>
+            <strong>9.9<span style="font-size:.6em">%</span></strong>
+            <span>真机 mask 前景占比</span>
           </div>
         </div>
       </section>
@@ -448,7 +453,7 @@
               <tbody>
                 <tr><td>交付</td><td><code>RenderStage</code> 协议、纹理池、命令缓冲与 in-flight 信号量、<code>StillImageFrameSource</code></td></tr>
                 <tr><td>动作</td><td>静态图 → Metal 上屏 → 接入 Core ML 分割 → 显示 mask</td></tr>
-                <tr><td><strong>验收</strong></td><td>真机上喂静态图，<strong>屏幕同时显示原图与 mask</strong></td></tr>
+                <tr><td><strong>验收</strong></td><td>✅ 真机 arm64 编译通过；模拟器实测左半原图、右半 mask，mask 前景占比 9.9% 与 Python 侧一致（真机部署待手机连线）</td></tr>
               </tbody>
             </table>
           </div>
@@ -705,6 +710,73 @@
         </article>
       </section>
 
+
+      <section class="doc-section" id="p1">
+        <div class="section-heading">
+          <h2>P1 实施记录</h2>
+          <p>渲染骨架 + 静态图分割上屏。本节的四个问题都是实施时实际卡住的点。</p>
+        </div>
+
+        <div class="callout" aria-label="P1 结论">
+          <div>
+            <span class="callout-label">P1 结论</span>
+            <h2>Metal 渲染骨架与 Core ML 分割已跑通并同屏显示</h2>
+          </div>
+          <p>工程用<strong>同步文件夹</strong>（新增源文件无需改 <code>project.pbxproj</code>，实测有效）。<code>.mlpackage</code> 被 Xcode 自动编译为 <code>humansegv2portrait.mlmodelc</code> 并随包；代码兼容 <code>mlmodelc</code> / <code>mlpackage</code> 两种形态。<code>RenderStage</code>（GPU 阶段）与 <code>TextureProducer</code>（CPU 生产者）拆分，公共 <code>outputHandle</code> 统一取句柄。</p>
+        </div>
+
+        <article class="gate-spec">
+          <header>
+            <div>
+              <span class="gate-number">R3</span>
+              <h3>四个实施问题</h3>
+            </div>
+            <span class="enforcement-badge">已全部解决</span>
+          </header>
+          <div class="table-wrap compact">
+            <table>
+              <thead>
+                <tr><th>#</th><th>问题</th><th>根因</th><th>解法</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>1</td><td>Metal 编译报 <code>cannot execute tool 'metal'</code></td><td>Xcode 26 起 Metal 工具链需单独下载</td><td><code>xcodebuild -downloadComponent MetalToolchain</code>（约 700 MB）</td></tr>
+                <tr><td>2</td><td><strong>画面从第 2 帧起全黑</strong></td><td><code>FrameContext</code> 每帧新建，persistent 纹理每帧都从池里拿到新空纹理，而 producer 的 dirty 标志已清不再重传</td><td>Renderer 持有 <code>persistentTextures[handle]</code>，跨帧复用同一张纹理</td></tr>
+                <tr><td>3</td><td>纹理回收与 in-flight 命令缓冲竞争</td><td>帧尾立刻把纹理还池，GPU 可能还在用</td><td>回收移入 <code>addCompletedHandler</code></td></tr>
+                <tr><td>4</td><td>mask 显示成<strong>红色</strong></td><td><code>r8Unorm</code> 采样得到 <code>(r,0,0,1)</code>，直接输出只有红通道有值</td><td>新增 <code>blit_fragment_gray</code> 复制 r 通道（对齐上游 <code>segment_postprocess_shader.glsl</code> 的 <code>.xxx</code>）</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>另有一处协议设计修正：<code>PipelineNode.output</code>（可选，nil=drawable）与 <code>TextureProducer.output</code>（非可选）类型冲突，改为在子协议中各声明、用 <code>outputHandle</code> 统一取用。</p>
+        </article>
+
+        <article class="gate-spec">
+          <header>
+            <div>
+              <span class="gate-number">R4</span>
+              <h3>验证结果</h3>
+            </div>
+            <span class="enforcement-badge">通过</span>
+          </header>
+          <div class="table-wrap compact">
+            <table>
+              <thead><tr><th>项</th><th>结果</th></tr></thead>
+              <tbody>
+                <tr><td>模拟器编译 / 运行</td><td>✅</td></tr>
+                <tr><td>真机 arm64 编译</td><td>✅（<code>-sdk iphoneos</code>，未签名）</td></tr>
+                <tr><td>Core ML 加载</td><td>✅ <code>humansegv2portrait.mlmodelc</code>，输入 256×144</td></tr>
+                <tr><td>分割耗时（模拟器 CPU）</td><td>81.3 ms</td></tr>
+                <tr><td>mask 前景占比</td><td><strong>9.9%</strong>，与 Python 侧 ONNX / Core ML 完全一致</td></tr>
+                <tr><td>屏幕输出</td><td>左半原图（均值 165.9）、右半 mask（人像剪影，灰度三通道均值 22.3/23.1/24.7）</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="spec-note">
+            <strong>待补</strong>
+            <p>真机（iPhone 16）部署时设备处于 <code>unavailable</code> 离线状态，待连线后补部署验证。</p>
+          </div>
+        </article>
+      </section>
+
       <section class="doc-section" id="changelog">
         <div class="section-heading">
           <h2>变更记录</h2>
@@ -717,6 +789,11 @@
               <tr><th>版本</th><th>日期</th><th>说明</th></tr>
             </thead>
             <tbody>
+              <tr>
+                <td>v0.3</td>
+                <td>2026-10-08</td>
+                <td><strong>P1 完成</strong>：手写同步文件夹工程 + Metal 渲染骨架（MetalContext / TexturePool / RenderStage / Renderer）+ Core ML 分割阶段 + 静态图与原图同屏；修掉 4 个实施问题（Metal 工具链、持久纹理每帧重分配导致黑屏、纹理回收竞争、r8Unorm 显示成红色）；真机 arm64 编译通过</td>
+              </tr>
               <tr>
                 <td>v0.2</td>
                 <td>2026-10-08</td>
@@ -738,11 +815,11 @@
           </div>
           <div>
             <strong>审核状态</strong>
-            <span>P0 已完成，进入 P1</span>
+            <span>P1 已完成，进入 P2</span>
           </div>
           <div>
             <strong>下次更新</strong>
-            <span>P1 渲染骨架完成、真机同屏显示原图与 mask 后</span>
+            <span>P2 相机链路与去遮挡闭环真机验证后</span>
           </div>
         </div>
       </section>
@@ -752,7 +829,7 @@
   <button class="back-to-top" id="back-to-top" aria-label="回到顶部">↑</button>
 
   <footer>
-    <p>DigiBoard · iOS 版 · 产品与移植文档 v0.2</p>
+    <p>DigiBoard · iOS 版 · 产品与移植文档 v0.3</p>
     <p>2026-10-08</p>
   </footer>
 
