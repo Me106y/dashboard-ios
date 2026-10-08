@@ -19,3 +19,6 @@ __pycache__/
 # 中间产物可重新生成，不入库；最终 .mlpackage 入库（App 需要）
 scripts/model-convert/output/*.onnx
 scripts/model-convert/output/*.mlmodel
+
+# 视频合成中间帧（可重新生成）
+scripts/model-convert/fixtures/frames/
