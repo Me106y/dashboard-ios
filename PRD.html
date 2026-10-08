@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DigiBoard iOS — 产品与移植文档 v0.4</title>
+  <title>DigiBoard iOS — 产品与移植文档 v0.5</title>
   <link rel="stylesheet" href="prd-styles.css">
 </head>
 <body>
@@ -39,6 +39,7 @@
         <a href="#p0">P0 转换实录</a>
         <a href="#p1">P1 实施记录</a>
         <a href="#p2p5">P2–P5 实施记录</a>
+        <a href="#device">真机联调记录</a>
         <a href="#changelog">变更记录</a>
       </nav>
       <div class="sidebar-note">
@@ -54,8 +55,8 @@
           <h1>DigiBoard iOS</h1>
           <p class="hero-lead">相机取景 → 人像分割 → 时序背景重建（去遮挡）→ 透视校正 → 图像增强 → 全屏显示。</p>
           <div class="meta-row" aria-label="文档元数据">
-            <span>版本 0.4</span>
-            <span>状态：P2–P5 代码已完成 · 待真机联调</span>
+            <span>版本 0.5</span>
+            <span>状态：真机联调进行中 · 性能达标</span>
             <span>更新：2026-10-08</span>
           </div>
         </div>
@@ -875,6 +876,109 @@
         </article>
       </section>
 
+
+      <section class="doc-section" id="device">
+        <div class="section-heading">
+          <h2>真机联调记录</h2>
+          <p>设备：iPhone 16（iOS 26），1920×1080 @30fps。</p>
+        </div>
+
+        <article class="gate-spec">
+          <header>
+            <div>
+              <span class="gate-number">R8</span>
+              <h3>四个真机问题</h3>
+            </div>
+            <span class="enforcement-badge">已全部修复</span>
+          </header>
+          <div class="table-wrap compact">
+            <table>
+              <thead><tr><th>#</th><th>现象</th><th>根因</th><th>解法</th></tr></thead>
+              <tbody>
+                <tr><td>1</td><td>相机出的是 1080×1920 竖向缓冲区，与 2556×1179 横屏画布不匹配</td><td><code>videoRotationAngle = 90</code> 把原生 1920×1080 转成了竖向</td><td>改为 <strong>0°</strong>（旋转交给 <code>AVCaptureConnection</code>，不在着色器里补）</td></tr>
+                <tr><td>2</td><td>角点检测 <strong>300ms</strong>，且跑在命令缓冲完成回调里，把 30fps 拖到 <strong>17.6fps</strong></td><td>霍夫 + 四重循环四边形搜索是 CPU 重活，且堵在渲染线程</td><td>移到后台队列 + <code>maxLines</code> 50→20（约 39 万次迭代降到 1 万）</td></tr>
+                <tr><td>3</td><td>自动角点<strong>检出率 0</strong>（找到 50 条直线却没有一个四边形通过）</td><td>命中上游源码里注明的 LIMITATION：上游「先取面积最大、再判断是否合理」，不合理就整帧放弃</td><td>改为<strong>只在角度合理的候选里取面积最大者</strong></td></tr>
+                <tr><td>4</td><td>抓帧功能卡死</td><td>在 Metal 完成回调里新建命令缓冲并 <code>waitUntilCompleted()</code> → 死锁</td><td>改为帧内 blit 到 shared 暂存纹理，完成回调里异步回读</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="table-wrap compact" style="margin-top:16px">
+            <table>
+              <thead><tr><th>指标</th><th>修复前</th><th>修复后</th></tr></thead>
+              <tbody>
+                <tr><td>帧率</td><td>17.6 fps</td><td><strong>稳定 30 fps</strong></td></tr>
+                <tr><td>分割推理</td><td>—</td><td><strong>8–21 ms</strong>（ANE 生效；模拟器 CPU 需 81ms）</td></tr>
+                <tr><td>前景占比</td><td>—</td><td>5–8%</td></tr>
+                <tr><td>角点检出</td><td>0 次</td><td><strong>100%</strong>，20 条直线 / 约 150ms（后台线程）</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="gate-spec">
+          <header>
+            <div>
+              <span class="gate-number">R9</span>
+              <h3>白平衡「全白」的排查结论</h3>
+            </div>
+            <span class="enforcement-badge">确认为忠实移植</span>
+          </header>
+          <p>抓帧显示最终输出 95.7% 为纯白，逐级抓帧定位到白平衡阶段（均值 248.6 / 97.9% &gt; 200）。用 Python 按同一公式复算并与 GPU 输出比对：</p>
+          <div class="table-wrap compact">
+            <table>
+              <thead><tr><th>指标</th><th>Python 复算</th><th>GPU 实际</th></tr></thead>
+              <tbody>
+                <tr><td>均值</td><td>250.3</td><td>248.6</td></tr>
+                <tr><td>&gt;200 占比</td><td>97.8%</td><td>97.9%</td></tr>
+                <tr><td>平均差</td><td>—</td><td><strong>9.1 / 255</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>公式 <code>out = 1 - 背景 + 原图</code> 本质是<strong>高通滤波</strong>：只保留「比局部均值更暗」的内容。对测试图统计，只有 <strong>2.7%</strong> 的像素比局部均值暗 0.20 以上，因此 97.8% 的像素必然输出为白。这套算法面向「白底 + 深色马克笔字」，对「房间里的白板照片」这类大块低对比度内容，压成白色正是其设计行为。</p>
+          <div class="spec-note">
+            <strong>判断增强效果的唯一有效场景是真实白板 + 深色笔迹</strong>
+            <p>上游自带的测试图（<code>whiteboard.jpg</code> / <code>imageenhancementtest.png</code> 等）同样是房间照片，并非白底黑字，因此静态测试图不具代表性。</p>
+          </div>
+        </article>
+
+        <article class="gate-spec">
+          <header>
+            <div>
+              <span class="gate-number">R10</span>
+              <h3>新增的开发期调试能力</h3>
+            </div>
+            <span class="enforcement-badge">工具</span>
+          </header>
+          <p>真机上既没有可视控制台，<code>devicectl</code> 也不提供截图能力，因此新增三个环境变量：</p>
+          <div class="table-wrap compact">
+            <table>
+              <thead><tr><th>环境变量</th><th>作用</th></tr></thead>
+              <tbody>
+                <tr><td><code>DB_DEBUG_VIEW=&lt;0..11&gt;</code></td><td>直接显示指定中间结果（0 = 最终输出）</td></tr>
+                <tr><td><code>DB_CAPTURE=&lt;文件名&gt;</code></td><td>把当前调试视图抓成 PNG 写入 App 的 Documents</td></tr>
+                <tr><td><code>DB_CAPTURE_FRAME=&lt;帧号&gt;</code></td><td>指定第几帧抓取（默认 90）</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>配合 <code>xcrun devicectl device copy from --domain-type appDataContainer</code> 可把真机渲染结果拉回本机分析。</p>
+        </article>
+
+        <article class="gate-spec">
+          <header>
+            <div>
+              <span class="gate-number">R11</span>
+              <h3>待完成</h3>
+            </div>
+            <span class="enforcement-badge">进行中</span>
+          </header>
+          <ul class="acceptance-list">
+            <li><strong>白板场景验证</strong>：把手机对准有深色笔迹的白板，确认最终输出保留笔迹、去遮挡生效</li>
+            <li>运行中掉线 / 锁屏后的恢复行为</li>
+            <li>角点检测仍有优化空间（150ms 不影响帧率，但占用后台 CPU）</li>
+          </ul>
+        </article>
+      </section>
+
       <section class="doc-section" id="changelog">
         <div class="section-heading">
           <h2>变更记录</h2>
@@ -887,6 +991,11 @@
               <tr><th>版本</th><th>日期</th><th>说明</th></tr>
             </thead>
             <tbody>
+              <tr>
+                <td>v0.5</td>
+                <td>2026-10-08</td>
+                <td><strong>真机联调</strong>：相机朝向修正（1920×1080 横屏）、角点检测移出渲染线程（fps 17.6→30）、修掉上游 LIMITATION 使角点检出率 0→100%、抓帧死锁修复；新增 <code>DB_CAPTURE</code> 真机抓帧能力；白平衡经 Python 复算确认为忠实移植（平均差 9.1/255）</td>
+              </tr>
               <tr>
                 <td>v0.4</td>
                 <td>2026-10-08</td>
@@ -918,11 +1027,11 @@
           </div>
           <div>
             <strong>审核状态</strong>
-            <span>P2–P5 代码已完成，待真机联调</span>
+            <span>真机联调进行中，性能达标</span>
           </div>
           <div>
             <strong>下次更新</strong>
-            <span>真机联调（去遮挡效果 + 1080p 帧率）后</span>
+            <span>白板场景验证后</span>
           </div>
         </div>
       </section>
@@ -932,7 +1041,7 @@
   <button class="back-to-top" id="back-to-top" aria-label="回到顶部">↑</button>
 
   <footer>
-    <p>DigiBoard · iOS 版 · 产品与移植文档 v0.4</p>
+    <p>DigiBoard · iOS 版 · 产品与移植文档 v0.5</p>
     <p>2026-10-08</p>
   </footer>
 
