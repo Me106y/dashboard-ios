@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DigiBoard iOS — 产品与移植文档 v0.3</title>
+  <title>DigiBoard iOS — 产品与移植文档 v0.4</title>
   <link rel="stylesheet" href="prd-styles.css">
 </head>
 <body>
@@ -38,6 +38,7 @@
         <a href="#structure">工程结构</a>
         <a href="#p0">P0 转换实录</a>
         <a href="#p1">P1 实施记录</a>
+        <a href="#p2p5">P2–P5 实施记录</a>
         <a href="#changelog">变更记录</a>
       </nav>
       <div class="sidebar-note">
@@ -53,8 +54,8 @@
           <h1>DigiBoard iOS</h1>
           <p class="hero-lead">相机取景 → 人像分割 → 时序背景重建（去遮挡）→ 透视校正 → 图像增强 → 全屏显示。</p>
           <div class="meta-row" aria-label="文档元数据">
-            <span>版本 0.3</span>
-            <span>状态：P1 已完成 · 进入 P2</span>
+            <span>版本 0.4</span>
+            <span>状态：P2–P5 代码已完成 · 待真机联调</span>
             <span>更新：2026-10-08</span>
           </div>
         </div>
@@ -72,8 +73,12 @@
             <span>ONNX↔Core ML 像素差</span>
           </div>
           <div>
-            <strong>9.9<span style="font-size:.6em">%</span></strong>
-            <span>真机 mask 前景占比</span>
+            <strong>26</strong>
+            <span>个管线节点</span>
+          </div>
+          <div>
+            <strong>15</strong>
+            <span>个单元测试通过</span>
           </div>
         </div>
       </section>
@@ -777,6 +782,99 @@
         </article>
       </section>
 
+
+      <section class="doc-section" id="p2p5">
+        <div class="section-heading">
+          <h2>P2–P5 实施记录</h2>
+          <p>相机零拷贝管线、完整 26 节点管线、透视校正、自动角点检测、图像增强、交互与收尾。</p>
+        </div>
+
+        <div class="callout" aria-label="P2-P5 结论">
+          <div>
+            <span class="callout-label">P2–P5 结论</span>
+            <h2>整条链路已装配完毕并在模拟器跑通，待真机联调</h2>
+          </div>
+          <p>相机走 <code>AVCaptureSession</code> + <code>CVMetalTextureCache</code> 零拷贝；分割推理在后台队列按每 5 帧节流；时序累积 + 遮罩存储构成去遮挡闭环；透视校正改解「目标 uv → 源 uv」单应矩阵后逐像素查表；增强链为白平衡 → 自适应二值化 → HSV 加色 → Letterbox。模拟器无相机，用 <code>StillImageFrameSource</code> 喂静态图跑通全链路。</p>
+        </div>
+
+        <article class="gate-spec">
+          <header>
+            <div>
+              <span class="gate-number">R5</span>
+              <h3>七个实施问题</h3>
+            </div>
+            <span class="enforcement-badge">已全部解决</span>
+          </header>
+          <div class="table-wrap compact">
+            <table>
+              <thead>
+                <tr><th>#</th><th>问题</th><th>根因</th><th>解法</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>1</td><td><strong>透视校正完全没生效、累积器从未清零</strong></td><td><code>prepare</code> 只写成协议扩展里的默认实现，调用走<strong>静态派发</strong>，子类实现永不执行</td><td>把 <code>prepare</code> 提升为<strong>协议要求</strong></td></tr>
+                <tr><td>2</td><td>霍夫一条直线都投不出来</td><td>上游阈值 150 按全分辨率定；我们在 1/4 降采样边缘图上跑，像素数少 4 倍</td><td>阈值按 <code>150 / scaleToSource</code> 折算，下限 25</td></tr>
+                <tr><td>3</td><td>管线依赖校验崩溃</td><td><code>CameraStage</code> 内部自造了一个同名新句柄，未复用管线句柄</td><td>构造函数改为接收句柄</td></tr>
+                <tr><td>4</td><td>合法反馈边被误判非法</td><td>时序累积的「上一帧」由排在后面的 CopyStage 产出</td><td>只允许 <strong>persistent</strong> 纹理的反馈边</td></tr>
+                <tr><td>5</td><td><code>ShaderPass</code> 无法继承</td><td>声明成 <code>final class</code></td><td>去掉 <code>final</code>，复用同一骨架</td></tr>
+                <tr><td>6</td><td><code>RenderStage.output</code> 可选性冲突</td><td>离屏阶段要非可选、上屏阶段要 nil</td><td>拆成 <code>OffscreenRenderStage</code> / <code>DrawableRenderStage</code></td></tr>
+                <tr><td>7</td><td>调试视图里 mask 显示成红色</td><td><code>r8Unorm</code> 采样是 <code>(r,0,0,1)</code></td><td>按 <code>pixelFormat</code> 自动切 <code>fs_blit_gray</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>另有一处工程配置问题：手写工程默认 scheme 不含测试动作，且 <code>&lt;TestPlans&gt;&lt;/TestPlans&gt;</code> 空元素会让 xcodebuild 报 <em>not currently configured for the test action</em>。已改为手写共享 scheme 并移除该空元素。</p>
+        </article>
+
+        <article class="gate-spec">
+          <header>
+            <div>
+              <span class="gate-number">R6</span>
+              <h3>最值得记的一条：Swift 协议扩展的静态派发</h3>
+            </div>
+            <span class="enforcement-badge">静默失败</span>
+          </header>
+          <p>默认实现写在协议扩展里、调用点通过协议类型访问时，Swift 使用<strong>静态派发</strong>，子类的具体实现永远不会被调用。后果是静默的：编译通过、运行不报错，只是透视矩阵一直是单位矩阵、累积器一直是脏数据。</p>
+          <div class="table-wrap compact">
+            <table>
+              <thead><tr><th>写法</th><th>结果</th></tr></thead>
+              <tbody>
+                <tr><td><code>extension PipelineNode { func prepare(...) {} }</code> + 子类实现</td><td>❌ 走扩展里的空实现</td></tr>
+                <tr><td><code>protocol PipelineNode { func prepare(...) }</code> + 扩展默认实现 + 子类实现</td><td>✅ 动态派发，子类实现生效</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="gate-spec">
+          <header>
+            <div>
+              <span class="gate-number">R7</span>
+              <h3>验证结果（模拟器）</h3>
+            </div>
+            <span class="enforcement-badge">通过</span>
+          </header>
+          <div class="table-wrap compact">
+            <table>
+              <thead><tr><th>项</th><th>结果</th></tr></thead>
+              <tbody>
+                <tr><td>管线装配</td><td>26 个节点全部解析，依赖校验通过</td></tr>
+                <tr><td>分割推理</td><td>首次约 81 ms（模拟器 CPU），前景占比 <strong>9.9%</strong>（与 Python 侧一致）</td></tr>
+                <tr><td>边缘检测</td><td>Canny 输出边缘像素 1444 / 48320（3.0%）</td></tr>
+                <tr><td>霍夫直线</td><td>13 条 → 角度分组 A=5 / B=8</td></tr>
+                <tr><td>自动角点</td><td>检测到四边形 <code>(677,27) (689,355) (1183,71) (1181,-2)</code></td></tr>
+                <tr><td>透视校正</td><td>修复 <code>prepare</code> 前后输出平均差 <strong>44.9</strong>（证明矩阵确实生效）</td></tr>
+                <tr><td>最终输出</td><td>提亮后的白板，显示区均值 209.6，高亮占比 86.5%</td></tr>
+                <tr><td>单元测试</td><td><strong>15 个全部通过</strong></td></tr>
+                <tr><td>真机 arm64 编译</td><td>✅（<code>-sdk iphoneos</code>，未签名）</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="spec-note">
+            <strong>待真机验证</strong>
+            <p>去遮挡效果（人走过时遮挡区被历史帧填上）、1080p 实测帧率、逐级视觉对照、自动角点在真实白板场景下的稳定性。静态图测试里白板占满整个画面、没有外边框可供检测，因此自动角点拾取到的是内部子区域——真实拍摄场景下会改善。</p>
+          </div>
+        </article>
+      </section>
+
       <section class="doc-section" id="changelog">
         <div class="section-heading">
           <h2>变更记录</h2>
@@ -789,6 +887,11 @@
               <tr><th>版本</th><th>日期</th><th>说明</th></tr>
             </thead>
             <tbody>
+              <tr>
+                <td>v0.4</td>
+                <td>2026-10-08</td>
+                <td><strong>P2–P5 代码完成</strong>：相机零拷贝管线、26 节点完整管线、<code>simd</code> 单应透视校正、自动角点检测（霍夫+四边形+平滑）、图像增强、交互控制条、15 个单元测试、<code>docs/glsl-to-msl.md</code>。记录 7 个实施问题，其中最关键的是 Swift 协议扩展静态派发导致 <code>prepare</code> 从不执行</td>
+              </tr>
               <tr>
                 <td>v0.3</td>
                 <td>2026-10-08</td>
@@ -815,11 +918,11 @@
           </div>
           <div>
             <strong>审核状态</strong>
-            <span>P1 已完成，进入 P2</span>
+            <span>P2–P5 代码已完成，待真机联调</span>
           </div>
           <div>
             <strong>下次更新</strong>
-            <span>P2 相机链路与去遮挡闭环真机验证后</span>
+            <span>真机联调（去遮挡效果 + 1080p 帧率）后</span>
           </div>
         </div>
       </section>
@@ -829,7 +932,7 @@
   <button class="back-to-top" id="back-to-top" aria-label="回到顶部">↑</button>
 
   <footer>
-    <p>DigiBoard · iOS 版 · 产品与移植文档 v0.3</p>
+    <p>DigiBoard · iOS 版 · 产品与移植文档 v0.4</p>
     <p>2026-10-08</p>
   </footer>
 

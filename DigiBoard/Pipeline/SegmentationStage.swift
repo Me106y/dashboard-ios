@@ -3,38 +3,62 @@ import CoreML
 import Metal
 import QuartzCore
 
-/// 分割阶段：调用 `SegmentationProvider` 推理，并把 mask 回填成纹理。
-/// 对应上游 `SegmentationStage` + `OpenCVDilateStage` + `BitmapToFramebufferStage`
-/// 这条链的入口部分。
-///
-/// 推理在后台队列执行，渲染线程不阻塞（决策 D13：推理与渲染解耦）。
-final class SegmentationStage: TextureProducer {
+/// 分割推理阶段（决策 D3 / D13）：
+/// - 作为 `TextureConsumer` 读取预处理后的 256×144 纹理（GPU 完成后回读）
+/// - 在后台队列跑 Core ML，按「每 N 帧一次」节流
+/// - 作为 `TextureProducer` 把最新 mask 回填成纹理，渲染线程不阻塞等推理
+final class SegmentationStage: TextureProducer, TextureConsumer {
     let name = "Segmentation"
-    let inputs: [TextureHandle] = []
+
+    /// [0] = 预处理后的输入纹理
+    let inputs: [TextureHandle]
     let output: TextureHandle
+    var consumed: TextureHandle { inputs[0] }
 
     private let provider: SegmentationProvider
     private let queue = DispatchQueue(label: "com.zhuanz.digiboard.segmentation", qos: .userInitiated)
 
+    /// 每 N 帧推理一次（30fps / 5 ≈ 6Hz，与上游 UpdateEveryXFrames 的思路一致）
+    var frameInterval = 5
+
     private let lock = NSLock()
-    private var latestResult: SegmentationMask?
-    private var isRunning = false
+    private var latestMask: SegmentationMask?
+    private var isInferring = false
     private var pendingImage: CGImage?
+    private var frameCounter = 0
 
-    /// 观测用
     private(set) var lastInferenceMillis: Double = 0
+    private(set) var lastForegroundRatio: Double = 0
+    private(set) var inferenceCount = 0
 
-    init(provider: SegmentationProvider, spec: TextureSpec) {
+    init(provider: SegmentationProvider, input: TextureHandle, output: TextureHandle) {
         self.provider = provider
-        self.output = TextureHandle("segmentation.mask", spec)
+        self.inputs = [input]
+        self.output = output
     }
 
-    /// 请求对某张图做分割；同一时刻只跑一次，最新请求覆盖排队中的请求。
-    func request(_ image: CGImage) {
+    // MARK: - 回读（渲染完成回调，非渲染线程）
+
+    func consume(_ bytes: UnsafeRawBufferPointer, width: Int, height: Int, bytesPerRow: Int) {
+        frameCounter += 1
+        guard frameCounter % max(frameInterval, 1) == 0 else { return }
+
+        lock.lock()
+        let busy = isInferring
+        lock.unlock()
+        guard !busy else { return }
+
+        guard let image = Self.makeImage(from: bytes, width: width, height: height, bytesPerRow: bytesPerRow) else {
+            return
+        }
+        enqueue(image)
+    }
+
+    private func enqueue(_ image: CGImage) {
         lock.lock()
         pendingImage = image
-        let shouldStart = !isRunning
-        if shouldStart { isRunning = true }
+        let shouldStart = !isInferring
+        if shouldStart { isInferring = true }
         lock.unlock()
         if shouldStart { pump() }
     }
@@ -46,7 +70,7 @@ final class SegmentationStage: TextureProducer {
         lock.unlock()
 
         guard let image else {
-            lock.lock(); isRunning = false; lock.unlock()
+            lock.lock(); isInferring = false; lock.unlock()
             return
         }
 
@@ -56,37 +80,35 @@ final class SegmentationStage: TextureProducer {
             do {
                 let mask = try self.provider.segment(image)
                 self.lastInferenceMillis = (CACurrentMediaTime() - start) * 1000
-                print(String(format: "[P1] 分割完成 %.1fms mask=%dx%d 前景=%.1f%%",
-                             self.lastInferenceMillis, mask.width, mask.height,
-                             mask.foregroundRatio * 100))
-                self.lock.lock(); self.latestResult = mask; self.lock.unlock()
+                self.lastForegroundRatio = mask.foregroundRatio
+                self.inferenceCount += 1
+                self.lock.lock(); self.latestMask = mask; self.lock.unlock()
             } catch {
                 print("[Segmentation] 推理失败: \(error)")
             }
-            self.pump()   // 继续消化排队的请求
+            self.pump()
         }
     }
 
+    // MARK: - 回填（渲染线程）
+
     func produce(_ ctx: FrameContext, texture: MTLTexture) throws {
         lock.lock()
-        let result = latestResult
-        latestResult = nil
+        let mask = latestMask
+        latestMask = nil
         lock.unlock()
 
-        guard let result else { return }
-        upload(result, into: texture)
+        guard let mask else { return }
+        upload(mask, into: texture)
     }
 
     private func upload(_ mask: SegmentationMask, into texture: MTLTexture) {
-        // CPU 侧缩放不需要：模型输出就是纹理尺寸（256x144）
         let width = min(mask.width, texture.width)
         let height = min(mask.height, texture.height)
         guard width == texture.width, height == texture.height else {
             print("[Segmentation] mask \(mask.width)x\(mask.height) 与纹理 \(texture.width)x\(texture.height) 不一致")
             return
         }
-        // 标签是 0/1，而 r8Unorm 需要 0-255 才有可见对比度
-        // （对应上游 Visualize.visSegmentation 输出 0/255 的行为）
         var pixels = [UInt8](repeating: 0, count: width * height)
         for index in 0..<(width * height) {
             pixels[index] = mask.labels[index] == 0 ? 0 : 255
@@ -98,5 +120,34 @@ final class SegmentationStage: TextureProducer {
                             withBytes: base,
                             bytesPerRow: width)
         }
+    }
+
+    /// RGBA8 字节 -> CGImage（Core ML 的图像输入）
+    private static func makeImage(from bytes: UnsafeRawBufferPointer,
+                                  width: Int,
+                                  height: Int,
+                                  bytesPerRow: Int) -> CGImage? {
+        guard width > 0, height > 0 else { return nil }
+        // 拷贝一份：回读缓冲区随帧复用，不能持有其指针
+        var copy = [UInt8](repeating: 0, count: bytesPerRow * height)
+        let byteCount = min(bytes.count, bytesPerRow * height)
+        copy.withUnsafeMutableBytes { destination in
+            guard let destinationBase = destination.baseAddress,
+                  let sourceBase = bytes.baseAddress else { return }
+            memcpy(destinationBase, sourceBase, byteCount)
+        }
+        let data = Data(copy) as CFData
+        guard let provider = CGDataProvider(data: data) else { return nil }
+        return CGImage(width: width,
+                       height: height,
+                       bitsPerComponent: 8,
+                       bitsPerPixel: 32,
+                       bytesPerRow: bytesPerRow,
+                       space: CGColorSpaceCreateDeviceRGB(),
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider,
+                       decode: nil,
+                       shouldInterpolate: false,
+                       intent: .defaultIntent)
     }
 }

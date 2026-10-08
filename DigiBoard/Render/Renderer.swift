@@ -12,7 +12,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     private(set) var nodes: [PipelineNode] = []
 
     private let inFlight = DispatchSemaphore(value: 3)
-    private let stats = FrameStats()
+    let stats = FrameStats()
 
     /// 跨帧保留的纹理（persistent 句柄 -> 纹理）。
     ///
@@ -35,14 +35,27 @@ final class Renderer: NSObject, MTKViewDelegate {
         validate()
     }
 
-    /// 依赖校验：每个节点声明的输入必须由更早的节点输出。
+    /// 依赖校验：
+    /// - 每个输入都必须有生产者
+    /// - 生产者晚于消费者时，只允许出现在 `persistent` 纹理上（即合法的反馈边，
+    ///   例如时序累积的「上一帧」缓冲）
     private func validate() {
-        var available = Set<TextureHandle>()
-        for node in nodes {
-            for input in node.inputs where !available.contains(input) {
-                assertionFailure("阶段「\(node.name)」的输入「\(input.name)」没有任何更早的阶段产出")
+        var producerIndex: [TextureHandle: Int] = [:]
+        for (index, node) in nodes.enumerated() {
+            guard let out = node.outputHandle else { continue }
+            if producerIndex[out] == nil { producerIndex[out] = index }
+        }
+
+        for (index, node) in nodes.enumerated() {
+            for input in node.inputs {
+                guard let producer = producerIndex[input] else {
+                    assertionFailure("阶段「\(node.name)」的输入「\(input.name)」没有任何生产者")
+                    continue
+                }
+                if producer > index, !input.spec.persistent {
+                    assertionFailure("阶段「\(node.name)」的输入「\(input.name)」由更晚的阶段产出，且不是持久纹理")
+                }
             }
-            if let out = node.outputHandle { available.insert(out) }
         }
     }
 
@@ -64,6 +77,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             print("[P1] frame \(stats.frameCount) drawable=\(Int(view.drawableSize.width))x\(Int(view.drawableSize.height)) | \(detail)")
         }
 
+        let cpuStart = CACurrentMediaTime()
         let ctx = FrameContext(metal: metal,
                                commandBuffer: commandBuffer,
                                drawableSize: view.drawableSize)
@@ -87,7 +101,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         var drawableCleared = false
         for case let stage as RenderStage in nodes {
             let descriptor: MTLRenderPassDescriptor
-            if let output = stage.output {
+            if let output = (stage as? OffscreenRenderStage)?.output {
                 descriptor = MTLRenderPassDescriptor()
                 descriptor.colorAttachments[0].texture = try? ctx.texture(output)
                 descriptor.colorAttachments[0].loadAction = .clear
@@ -101,6 +115,7 @@ final class Renderer: NSObject, MTKViewDelegate {
                 drawableCleared = true
             }
 
+            stage.prepare(ctx)
             guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { continue }
             encoder.label = stage.name
             do {
@@ -113,18 +128,44 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         // 4) 非 persistent 纹理在 GPU 用完之后才归还池中，
         //    否则会和仍在 in-flight 的命令缓冲抢同一张纹理。
+        // 需要在 GPU 完成后回读的纹理（边缘图 / 分割输入）
+        let consumers: [(TextureConsumer, TextureSpec, MTLTexture)] = nodes.compactMap { node in
+            guard let consumer = node as? TextureConsumer,
+                  let texture = try? ctx.texture(consumer.consumed) else { return nil }
+            return (consumer, consumer.consumed.spec, texture)
+        }
+
         let recyclables: [(TextureSpec, MTLTexture)] = nodes.compactMap { node in
             guard let out = node.outputHandle, !out.spec.persistent,
                   let texture = try? ctx.texture(out) else { return nil }
             return (out.spec, texture)
         }
 
+        let cpuSeconds = CACurrentMediaTime() - cpuStart
         commandBuffer.addCompletedHandler { [weak self] buffer in
             guard let self else { return }
+
+            // 先做 CPU 回读（纹理仍是 .shared，可直接 getBytes）
+            for (consumer, _, texture) in consumers {
+                let bytesPerRow = texture.width * 4
+                var buffer = [UInt8](repeating: 0, count: bytesPerRow * texture.height)
+                buffer.withUnsafeMutableBytes { raw in
+                    guard let base = raw.baseAddress else { return }
+                    texture.getBytes(base, bytesPerRow: bytesPerRow,
+                                     from: MTLRegionMake2D(0, 0, texture.width, texture.height),
+                                     mipmapLevel: 0)
+                    consumer.consume(UnsafeRawBufferPointer(raw),
+                                     width: texture.width,
+                                     height: texture.height,
+                                     bytesPerRow: bytesPerRow)
+                }
+            }
+
             for (spec, texture) in recyclables {
                 self.metal.texturePool.recycle(spec, texture)
             }
-            self.stats.record(gpuSeconds: buffer.gpuEndTime - buffer.gpuStartTime)
+            self.stats.record(gpuSeconds: buffer.gpuEndTime - buffer.gpuStartTime,
+                              cpuSeconds: cpuSeconds)
             self.inFlight.signal()
         }
         inFlight.wait()
@@ -159,12 +200,15 @@ private extension FrameContext {
 final class FrameStats {
     private(set) var frameCount = 0
     private(set) var lastGPUMillis: Double = 0
+    /// 最近一帧的 CPU 侧耗时（阶段编码 + 提交）
+    private(set) var lastFrameMillis: Double = 0
     private var windowStart = CACurrentMediaTime()
     private var windowFrames = 0
     private(set) var fps: Double = 0
 
-    func record(gpuSeconds: CFTimeInterval) {
+    func record(gpuSeconds: CFTimeInterval, cpuSeconds: CFTimeInterval = 0) {
         frameCount += 1
+        if cpuSeconds > 0 { lastFrameMillis = cpuSeconds * 1000 }
         windowFrames += 1
         if gpuSeconds > 0 { lastGPUMillis = gpuSeconds * 1000 }
         let now = CACurrentMediaTime()

@@ -13,6 +13,7 @@
 | --- | --- |
 | [`PRD.html`](PRD.html) | **产品与移植文档（推荐阅读，含导航与打印）** |
 | [`PRD.md`](PRD.md) | 同一份文档的 Markdown 母本 |
+| [`docs/glsl-to-msl.md`](docs/glsl-to-msl.md) | 28 个 GLSL 着色器的逐条移植对照 |
 
 打开方式：
 
@@ -22,7 +23,7 @@ open PRD.html
 
 ## 技术栈
 
-- **图形**：Metal（`MTKView` + `CVMetalTextureCache`），21 个 MSL 着色器
+- **图形**：Metal（`MTKView` + `CVMetalTextureCache`），21 个 MSL 着色器，26 个管线节点
 - **推理**：Core ML（`PP-HumanSegV2 portrait`，pdmodel → ONNX → `.mlpackage`），ANE 加速
 - **相机**：AVFoundation，1920×1080 @ 30fps，`32BGRA` 零拷贝
 - **界面**：SwiftUI 外壳 + UIKit `MTKView` 画布
@@ -32,16 +33,23 @@ open PRD.html
 
 ## 当前状态
 
-**方案已定稿，待开工 P0。** 分六期交付：
+**P2–P5 代码已完成，待真机联调。** 分六期交付：
 
-| 期 | 内容 | 验收 |
+| 期 | 内容 | 状态 |
 | --- | --- | --- |
-| P0 | 模型闸门：pdmodel → ONNX → Core ML | 视觉验收：mask 能合理抠出人像 |
-| P1 | 渲染骨架 + 静态图 → mask | 真机同屏显示原图与 mask |
-| P2 | 相机链路 + 去遮挡闭环 | 人走过时遮挡区被历史帧填上 |
-| P3 | 透视校正（自动 / 手动） | 白板被摆正，双模式可切换 |
-| P4 | 图像增强 | 逐级对照 Android 版视觉一致 |
-| P5 | 交互与收尾 | 控件可用、单测通过、文档齐全 |
+| P0 | 模型闸门：pdmodel → ONNX → Core ML | ✅ 完成（ONNX↔Core ML 不一致像素 0.073%、前景 IoU 0.9926） |
+| P1 | 渲染骨架 + 静态图 → mask | ✅ 完成（模拟器实测 mask 前景 9.9%） |
+| P2 | 相机链路 + 去遮挡闭环 | 🟡 代码完成，待真机验证去遮挡效果与 1080p 帧率 |
+| P3 | 透视校正（自动 / 手动） | 🟡 代码完成，模拟器检测到四边形，待真机验证稳定性 |
+| P4 | 图像增强 | 🟡 代码完成，待真机逐级视觉对照 |
+| P5 | 交互与收尾 | ✅ 完成（控制条 + 逐级调试视图 + 15 个单测 + 着色器对照文档） |
+
+跑测试：
+
+```bash
+xcodebuild test -project DigiBoard.xcodeproj -scheme DigiBoard \
+  -destination 'platform=iOS Simulator,name=iPhone 17'
+```
 
 详见 [PRD](PRD.html) 的「分期计划与验收标准」。
 

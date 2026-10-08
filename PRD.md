@@ -1,6 +1,6 @@
 # DigiBoard iOS — 产品与移植文档
 
-> 版本 **0.3** · 状态：**P1 已完成（渲染骨架 + 静态图分割上屏）· 进入 P2** · 更新：2026-10-08
+> 版本 **0.4** · 状态：**P2–P5 代码已完成，待真机联调** · 更新：2026-10-08
 >
 > 本文档是 DigiBoard iOS 版的唯一事实来源：记录上游 Android 版盘点结论、14 项架构决策、
 > 管线与着色器映射、分期验收标准、风险与工程结构。
@@ -389,10 +389,89 @@ DigiBoard/
 
 ---
 
+## 14. P2–P5 实施记录
+
+### 14.1 交付清单
+
+| 层 | 文件 | 内容 |
+| --- | --- | --- |
+| 几何 | `Geometry/` | `Primitives`（LineSegment/Quad/面积）· `HoughLineDetector`（替代 `Imgproc.HoughLines`）· `BiggestQuad`（含 `fixupQuad`/`makeQuadConvex`/角度校验）· `PointSmoother`（20 帧加权）· `Homography`（simd 单应）· `CornerTracker`（自动/手动状态机） |
+| 相机 | `Camera/` | `FrameSource` 协议 · `CameraFrameSource`（AVCaptureSession + CVMetalTextureCache 零拷贝）· `StillImageFrameSource`（模拟器/静态图） |
+| 管线 | `Pipeline/` | 26 个节点：`CameraStage` · 分割 5 阶段 · 边缘链 6 阶段 · `PerspectiveStage` · 增强 7 阶段 · `PresentStage` · `CornerOverlayStage` |
+| 着色器 | `Shaders/` | 5 个 `.metal` 文件，21 个 GLSL 的对应实现 + `fs_perspective_lookup` |
+| 文档 | `docs/glsl-to-msl.md` | 28 个 GLSL 的逐条对照 + 通用翻译规则 + 结构体对齐表 |
+| 测试 | `DigiBoardTests/` | 15 个用例（几何 10 + 渲染 5） |
+
+### 14.2 实施中修掉的七个问题
+
+| # | 问题 | 根因 | 解法 |
+| --- | --- | --- | --- |
+| 1 | **透视校正完全没生效、累积器从未清零** | `prepare` 只写成协议扩展里的默认实现，`stage.prepare(ctx)` 走**静态派发**，子类实现永远不被调用，单应矩阵一直是单位矩阵 | 把 `prepare` 提升为**协议要求**（见 §14.3） |
+| 2 | 霍夫一条直线都投不出来 | 上游阈值 150 是按全分辨率定的；我们在 1/4 降采样边缘图上跑，同一条边像素数少 4 倍 | 阈值按 `150 / scaleToSource` 折算，下限 25 |
+| 3 | 管线依赖校验崩溃 | `CameraStage` 内部 `new` 了一个同名新句柄，没复用管线里的句柄，导致下游句柄"无生产者" | 构造函数改为接收句柄，不再自造 |
+| 4 | 合法的反馈边被误判为非法 | 时序累积的"上一帧"由排在后面的 `CopyStage` 产出 | 校验规则放宽：**只允许 persistent 纹理的反馈边**，并保留非持久反馈边的断言 |
+| 5 | `ShaderPass` 无法被继承 | 声明成 `final class` | 去掉 `final`，让 `GrayscaleStage`/`ScaleStage`/`SaturateStage` 复用同一骨架 |
+| 6 | `RenderStage.output` 可选性冲突 | 离屏阶段要非可选、上屏阶段要 nil | 拆成 `OffscreenRenderStage`（有 output）与 `DrawableRenderStage`（画到 drawable） |
+| 7 | 调试视图里 mask 显示成红色 | `r8Unorm` 采样是 `(r,0,0,1)` | `PresentStage` 按 `pixelFormat` 自动切到 `fs_blit_gray` |
+
+另有一处工程配置问题：手写工程默认 scheme 不含测试动作，且 `<TestPlans></TestPlans>` 空元素会让
+xcodebuild 报 "not currently configured for the test action"。已改为手写共享 scheme 并移除该空元素。
+
+### 14.3 最值得记的一条：Swift 协议扩展的静态派发
+
+```swift
+protocol PipelineNode: AnyObject { ... }
+extension PipelineNode {
+    func prepare(_ ctx: FrameContext) {}      // 只是默认实现
+}
+final class PerspectiveStage: OffscreenRenderStage {
+    func prepare(_ ctx: FrameContext) { ... } // ❌ 永远不会被调用
+}
+// 调用点
+stage.prepare(ctx)   // 静态派发 → 走扩展里的空实现
+```
+
+**后果是静默的**：编译通过、运行不报错，只是透视矩阵一直是单位矩阵、累积器一直是脏数据。
+修法是把 `prepare` 写进协议体，使它成为**协议要求**，扩展只提供默认实现：
+
+```swift
+protocol PipelineNode: AnyObject {
+    func prepare(_ ctx: FrameContext)   // ✅ 协议要求 → 动态派发
+}
+extension PipelineNode {
+    func prepare(_ ctx: FrameContext) {}   // 默认实现
+}
+```
+
+### 14.4 验证结果（模拟器）
+
+模拟器没有相机，用 `StillImageFrameSource` 喂 `still_sample.jpg` 跑通整条管线。
+
+| 项 | 结果 |
+| --- | --- |
+| 管线装配 | 26 个节点全部解析，依赖校验通过 |
+| Core ML 加载 | `humansegv2portrait.mlmodelc`，输入 256×144 |
+| 分割推理 | 首次约 81 ms（模拟器 CPU），前景占比 **9.9%**（与 Python 侧逐像素一致） |
+| 边缘检测 | Canny 输出边缘像素 1444 / 48320（3.0%） |
+| 霍夫直线 | 13 条 → 角度分组 A=5 / B=8 |
+| 自动角点 | 检测到四边形 `(677,27) (689,355) (1183,71) (1181,-2)` |
+| 透视校正 | 修复 `prepare` 前后输出平均差 **44.9**（证明矩阵确实生效） |
+| 最终输出 | 提亮后的白板，显示区均值 209.6，高亮占比 86.5% |
+| 单元测试 | **15 个全部通过** |
+| 真机 arm64 编译 | ✅（`-sdk iphoneos`，未签名） |
+
+> **待真机验证**：去遮挡效果（人走过时遮挡区被历史帧填上）、1080p 实测帧率、逐级视觉对照、
+> 自动角点在真实白板场景下的稳定性。静态图测试里白板占满整个画面、没有外边框可供检测，
+> 所以自动角点拾取到的是内部子区域——这在真实拍摄场景下会改善。
+
+
+---
+
 ## 11. 变更记录
 
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
+| v0.4 | 2026-10-08 | **P2–P5 代码完成**：相机零拷贝管线、26 节点完整管线、`simd` 单应透视校正、自动角点检测（霍夫+四边形+平滑）、图像增强、交互控制条、15 个单元测试、`docs/glsl-to-msl.md`。记录 7 个实施问题，其中最关键的是 Swift 协议扩展静态派发导致 `prepare` 从不执行（透视矩阵一直为单位矩阵） |
 | v0.3 | 2026-10-08 | **P1 完成**：手写同步文件夹工程 + Metal 渲染骨架（MetalContext/TexturePool/RenderStage/Renderer）+ Core ML 分割阶段 + 静态图与原图同屏；修掉 4 个实施问题（Metal 工具链、持久纹理每帧重分配导致黑屏、纹理回收竞争、r8Unorm 显示成红色）；真机 arm64 编译通过 |
 | v0.2 | 2026-10-08 | **P0 完成**：pdmodel→ONNX→Core ML 全链路打通，模型 1.9 MB，ONNX↔Core ML 不一致像素 0.073% / 前景 IoU 0.9926；记录 6 个转换卡点与解法（见 §12）；新增 `scripts/model-convert/` 工具链与说明 |
 | v0.1 | 2026-10-08 | 初始版本。完成上游 Android 版盘点（96 文件 / 28 着色器 / 模型归属确认 / 7 项缺陷发现），确定 D1–D14 架构决策、管线与着色器映射、P0–P5 分期与验收标准 |

@@ -3,11 +3,10 @@ import simd
 
 /// 把一个输入纹理绘制到 drawable 的指定区域（归一化坐标，原点左下）。
 /// 对应上游把阶段输出送上屏幕的那一步；也用于逐级调试视图。
-final class BlitStage: RenderStage {
+final class BlitStage: DrawableRenderStage {
     let name: String
     let inputs: [TextureHandle]
     /// nil = 直接绘制到 drawable
-    let output: TextureHandle? = nil
 
     private let source: TextureHandle
     /// 归一化目标区域（0..1，原点左下）
