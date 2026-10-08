@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+
+# 模型转换中间产物（保留最终 .mlpackage）
+scripts/**/*.onnx
+scripts/**/__pycache__/
+scripts/**/.venv/
+*.pdmodel
+*.pdiparams
+*.pdiparams.info
+
+# Python
+__pycache__/
+.venv/
