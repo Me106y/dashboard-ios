@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DigiBoard iOS — 产品与移植文档 v0.5</title>
+  <title>DigiBoard iOS — 产品与移植文档 v0.6</title>
   <link rel="stylesheet" href="prd-styles.css">
 </head>
 <body>
@@ -40,6 +40,7 @@
         <a href="#p1">P1 实施记录</a>
         <a href="#p2p5">P2–P5 实施记录</a>
         <a href="#device">真机联调记录</a>
+        <a href="#video">视频测试与范围收敛</a>
         <a href="#changelog">变更记录</a>
       </nav>
       <div class="sidebar-note">
@@ -55,8 +56,8 @@
           <h1>DigiBoard iOS</h1>
           <p class="hero-lead">相机取景 → 人像分割 → 时序背景重建（去遮挡）→ 透视校正 → 图像增强 → 全屏显示。</p>
           <div class="meta-row" aria-label="文档元数据">
-            <span>版本 0.5</span>
-            <span>状态：真机联调进行中 · 性能达标</span>
+            <span>版本 0.6</span>
+            <span>状态：纯自动管线 + 视频测试 · 去遮挡已验证</span>
             <span>更新：2026-10-08</span>
           </div>
         </div>
@@ -979,6 +980,96 @@
         </article>
       </section>
 
+
+      <section class="doc-section" id="video">
+        <div class="section-heading">
+          <h2>视频测试与范围收敛</h2>
+          <p>v0.6 把 App 收敛为纯自动管线，并加入离线视频输入，使整条链路可在模拟器上验证。</p>
+        </div>
+
+        <article class="gate-spec">
+          <header>
+            <div><span class="gate-number">R12</span><h3>需求变更</h3></div>
+            <span class="enforcement-badge">v0.6</span>
+          </header>
+          <div class="table-wrap compact">
+            <table>
+              <thead><tr><th>变更</th><th>处置</th></tr></thead>
+              <tbody>
+                <tr><td>不做角点检测与透视校正</td><td>删除 <code>Geometry/</code>（6 个文件）、<code>PerspectiveStage</code>、<code>Perspective.metal</code> 及对应单测；管线 <strong>26 → 17 节点</strong></td></tr>
+                <tr><td>不做拖动角点与点击切换</td><td>继续清理无引用的 <code>BlitStage</code> / <code>StillImageStage</code> 与角点着色器函数</td></tr>
+                <tr><td>新增「离线视频测试」按钮</td><td><code>VideoFrameSource</code>（<code>AVAssetReader</code> + <code>CVMetalTextureCache</code> 零拷贝，循环播放）；UI 提供「切换到视频测试」与「选择视频…」；<strong>模拟器无相机时默认走视频</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="gate-spec">
+          <header>
+            <div><span class="gate-number">R13</span><h3>三个隐藏 bug</h3></div>
+            <span class="enforcement-badge">已修复</span>
+          </header>
+          <p>这三个都表现为「结果不对但看不出原因」，逐个记录以免重蹈：</p>
+          <div class="table-wrap compact">
+            <table>
+              <thead><tr><th>#</th><th>Bug</th><th>现象</th><th>根因</th></tr></thead>
+              <tbody>
+                <tr><td>1</td><td><strong><code>vs_quad</code> 的 uv 少了垂直翻转</strong></td><td>遮罩永远圈不到人</td><td>NDC 的 y 轴朝上、纹理 v 轴朝下。管线内每级全屏 pass 都翻转画面，经过<strong>奇数级</strong>的分支就与 Core ML 输出的 mask 垂直错位。<code>vs_blit</code> 里写对了，所以<strong>上屏显示正常，掩盖了内部错位</strong></td></tr>
+                <tr><td>2</td><td><strong><code>MLMultiArray</code> 用裸指针顺序读</strong></td><td>mask 只覆盖一条窄竖条</td><td>Core ML 输出数组不保证连续存储，必须按 <code>strides</code> 索引</td></tr>
+                <tr><td>3</td><td><strong>抓帧回读 r8Unorm 按 4 字节/像素</strong></td><td>诊断工具误导了一整轮</td><td>单通道纹理每行只有 <code>width</code> 字节；按 <code>width*4</code> 读会拿到错位数据</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="spec-note">
+            <strong>诊断工具本身也会骗人</strong>
+            <p>第 3 条发生时，日志显示分割前景 9.5%，而抓帧图算出 2.4%，我一度怀疑模型有问题，实际是抓帧回读的步长写错了。</p>
+          </div>
+        </article>
+
+        <article class="gate-spec">
+          <header>
+            <div><span class="gate-number">R14</span><h3>去遮挡验证</h3></div>
+            <span class="enforcement-badge">去除率 86%</span>
+          </header>
+          <p>测试素材 <code>sample_whiteboard.mp4</code> 是自制的：用 P0 的分割模型把真人抠出、合成到静止白板上，让人像横穿画面。对照组是合成时使用的<strong>干净白板背景真值</strong>，因此人像区内「<code>|cleaned − 背景|</code> 相对 <code>|source − 背景|</code> 的下降」就是去除率。</p>
+          <div class="table-wrap compact">
+            <table>
+              <thead><tr><th>指标</th><th>frameInterval=5</th><th>=2</th><th>=1</th></tr></thead>
+              <tbody>
+                <tr><td>mask 与真实人像 IoU</td><td>0.770</td><td>0.755</td><td><strong>0.838</strong></td></tr>
+                <tr><td>人像区 <code>|cleaned − 背景|</code></td><td>70.0</td><td>35.1</td><td><strong>15.9</strong></td></tr>
+                <tr><td>源帧同区域 <code>|source − 背景|</code></td><td>110.9</td><td>116.6</td><td>116.6</td></tr>
+                <tr><td><strong>去除率</strong></td><td>37%</td><td>70%</td><td><strong>86%</strong></td></tr>
+                <tr><td>非人像区 <code>|cleaned − source|</code></td><td>—</td><td>—</td><td><strong>1.2</strong>（背景正确用当前帧）</td></tr>
+                <tr><td>帧率 / 分割耗时</td><td>30fps / 23ms</td><td>30fps / 25ms</td><td><strong>30fps / 23–26ms</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="spec-note">
+            <strong>两处关键改进</strong>
+            <p>① 补上上游的 mask 膨胀（<code>OpenCVDilateStage</code> 的 5×5 矩形核），否则人像边缘那一圈不会被历史帧替换。② 分割节流 5 帧 → 1 帧：5 帧意味着 mask 最多滞后 5 帧，人像快移时<strong>未被 mask 盖住的人像像素被当作「背景稳定」，从而把人烤进历史缓冲</strong>，残影挥之不去。</p>
+          </div>
+        </article>
+
+        <article class="gate-spec">
+          <header>
+            <div><span class="gate-number">R15</span><h3>工程规模变化</h3></div>
+            <span class="enforcement-badge">收敛</span>
+          </header>
+          <div class="table-wrap compact">
+            <table>
+              <thead><tr><th></th><th>v0.5</th><th>v0.6</th></tr></thead>
+              <tbody>
+                <tr><td>Swift 文件</td><td>34</td><td>23</td></tr>
+                <tr><td>Metal 文件</td><td>5</td><td>4</td></tr>
+                <tr><td>管线节点</td><td>26</td><td><strong>17</strong></td></tr>
+                <tr><td>单元测试</td><td>15</td><td>5（几何相关的随功能一并删除）</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
       <section class="doc-section" id="changelog">
         <div class="section-heading">
           <h2>变更记录</h2>
@@ -991,6 +1082,11 @@
               <tr><th>版本</th><th>日期</th><th>说明</th></tr>
             </thead>
             <tbody>
+              <tr>
+                <td>v0.6</td>
+                <td>2026-10-08</td>
+                <td><strong>范围收敛 + 离线视频测试</strong>：移除角点检测与透视校正（26→17 节点）；新增 <code>VideoFrameSource</code> 与「视频测试」按钮，模拟器可直接验证整条管线；自制「真人走过静止白板」测试素材。修三个隐藏 bug（<code>vs_quad</code> 缺垂直翻转、<code>MLMultiArray</code> 未按 strides 读、抓帧 r8Unorm 步长错），补上 mask 膨胀、分割节流 5→1 帧。<strong>去遮挡去除率 37% → 86%</strong>，30fps 稳定</td>
+              </tr>
               <tr>
                 <td>v0.5</td>
                 <td>2026-10-08</td>
@@ -1027,11 +1123,11 @@
           </div>
           <div>
             <strong>审核状态</strong>
-            <span>真机联调进行中，性能达标</span>
+            <span>纯自动管线 + 视频测试，去遮挡已验证</span>
           </div>
           <div>
             <strong>下次更新</strong>
-            <span>白板场景验证后</span>
+            <span>真实白板场景验证后</span>
           </div>
         </div>
       </section>
@@ -1041,7 +1137,7 @@
   <button class="back-to-top" id="back-to-top" aria-label="回到顶部">↑</button>
 
   <footer>
-    <p>DigiBoard · iOS 版 · 产品与移植文档 v0.5</p>
+    <p>DigiBoard · iOS 版 · 产品与移植文档 v0.6</p>
     <p>2026-10-08</p>
   </footer>
 
