@@ -57,6 +57,11 @@ final class BoardViewModel: ObservableObject {
         }
         camera = CameraFrameSource(device: device)
 
+        // 打印沙盒路径：真机上便于用 devicectl 传文件 / 取产物
+        if let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            print("[App] Documents = \(documents.path)")
+        }
+
         #if targetEnvironment(simulator)
         cameraAvailable = false
         #else
