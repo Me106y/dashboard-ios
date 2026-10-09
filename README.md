@@ -21,6 +21,20 @@
 open PRD.html
 ```
 
+## 图标
+
+![DigiBoard](docs/app-icon.png)
+
+概念：**白板 + 正在被擦除的人影**——深色人像自左向右渐隐，板上的笔迹从人像身下透出来，
+正是这个 App 在做的事。用脚本绘制而非生成式出图，保证几何精确、小尺寸清晰、可复现：
+
+```bash
+scripts/.venv/bin/python scripts/assets/make_app_icon.py
+```
+
+源图在 `DigiBoard/Resources/Assets.xcassets/AppIcon.appiconset/`（1024×1024，无透明通道，
+其余尺寸由 Xcode 自动生成）。
+
 ## 技术栈
 
 - **图形**：Metal（`MTKView` + `CVMetalTextureCache`），21 个 MSL 着色器，26 个管线节点
