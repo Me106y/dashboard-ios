@@ -4,6 +4,14 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @StateObject private var model = BoardViewModel()
     @State private var showingVideoPicker = false
+    /// 控制面板是否展开：下滑收起、上滑展开
+    @State private var controlsExpanded = true
+
+    init() {
+        // 调试用：DB_CONTROLS=collapsed 启动即收起，便于截图核对两种状态
+        let collapsed = ProcessInfo.processInfo.environment["DB_CONTROLS"] == "collapsed"
+        _controlsExpanded = State(initialValue: !collapsed)
+    }
 
     var body: some View {
         ZStack {
@@ -75,28 +83,71 @@ struct ContentView: View {
     // MARK: - 底部控制面板
 
     private var controlPanel: some View {
-        VStack(spacing: 10) {
-            Picker("输入源", selection: modeBinding) {
-                ForEach(BoardViewModel.InputMode.allCases) { mode in
-                    Text(mode.rawValue).tag(mode)
+        VStack(spacing: controlsExpanded ? 10 : 0) {
+            // 抓手：既是收起的可视提示，也是上滑展开的落点
+            HStack(spacing: 6) {
+                if !controlsExpanded {
+                    Image(systemName: "chevron.up")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.5))
+                }
+                Capsule()
+                    .fill(.white.opacity(0.4))
+                    .frame(width: 42, height: 5)
+                if !controlsExpanded {
+                    Image(systemName: "chevron.up")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.5))
                 }
             }
-            .pickerStyle(.segmented)
-            .disabled(model.isImporting)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
 
-            if model.inputMode == .offline {
-                videoCard
-            } else {
-                Label("实时相机画面", systemImage: "camera.fill")
-                    .font(.caption)
-                    .foregroundStyle(.white.opacity(0.75))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 4)
+            if controlsExpanded {
+                Picker("输入源", selection: modeBinding) {
+                    ForEach(BoardViewModel.InputMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .disabled(model.isImporting)
+
+                if model.inputMode == .offline {
+                    videoCard
+                } else {
+                    Label("实时相机画面", systemImage: "camera.fill")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.75))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 4)
+                }
             }
         }
         .tint(.white)
-        .padding(12)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 12)
+        .padding(.top, 2)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(.white.opacity(0.10), lineWidth: 1)
+        )
+        // 下滑收起 / 上滑展开。最小位移 12pt，避免抢掉分段控件与按钮的点击
+        .gesture(
+            DragGesture(minimumDistance: 12)
+                .onEnded { value in
+                    let dy = value.translation.height
+                    withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
+                        if dy > 28 {
+                            controlsExpanded = false
+                        } else if dy < -28 {
+                            controlsExpanded = true
+                        }
+                    }
+                }
+        )
+        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: controlsExpanded)
     }
 
     /// 分段控件的绑定：没有相机时拒绝切到「实时视频」，并给出提示
