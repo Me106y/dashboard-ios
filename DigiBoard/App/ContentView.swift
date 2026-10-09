@@ -13,19 +13,21 @@ struct ContentView: View {
                 MetalCanvasView(renderer: renderer, preferredFPS: 30)
                     .ignoresSafeArea()
 
-                VStack {
+                VStack(spacing: 0) {
                     statusBar
-                    Spacer()
-                    controlBar
+                    Spacer(minLength: 8)
+                    controlPanel
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
             } else {
-                VStack(spacing: 12) {
+                VStack(spacing: 14) {
                     ProgressView()
                     Text(statusText)
                         .font(.footnote)
-                        .foregroundStyle(.white.opacity(0.8))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
                 }
             }
         }
@@ -33,8 +35,11 @@ struct ContentView: View {
         .fileImporter(isPresented: $showingVideoPicker,
                       allowedContentTypes: [.movie, .video],
                       allowsMultipleSelection: false) { result in
-            if case .success(let urls) = result, let url = urls.first {
-                model.useCustomVideo(url: url)
+            switch result {
+            case .success(let urls):
+                if let url = urls.first { model.useCustomVideo(url: url) }
+            case .failure(let error):
+                model.reportPickerFailure(error.localizedDescription)
             }
         }
     }
@@ -47,74 +52,108 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 顶部状态
+    // MARK: - 顶部状态条
 
     private var statusBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 9) {
             chip(statusText, systemImage: "video.fill")
-            if !model.sourceDescription.isEmpty {
-                chip(model.sourceDescription, systemImage: "doc.media")
-            }
             if model.fps > 0 {
-                chip(String(format: "%.1f fps", model.fps), systemImage: "speedometer")
+                chip(String(format: "%.0f fps", model.fps), systemImage: "speedometer")
             }
             if model.inferenceMillis > 0 {
                 chip(String(format: "分割 %.0f ms", model.inferenceMillis),
                      systemImage: "person.crop.rectangle")
             }
             if model.foregroundRatio > 0 {
-                chip(String(format: "人像 %.1f%%", model.foregroundRatio * 100),
+                chip(String(format: "人像 %.0f%%", model.foregroundRatio * 100),
                      systemImage: "figure.stand")
             }
-            Spacer()
+            Spacer(minLength: 0)
         }
     }
 
-    // MARK: - 底部控制条
+    // MARK: - 底部控制面板
 
-    private var controlBar: some View {
-        HStack(spacing: 12) {
-            // 主按钮：有相机时在「离线视频 ↔ 相机」之间切换；
-            // 没有相机（模拟器）时直接显示当前处于视频测试模式，避免出现一个点不动的按钮
-            if model.cameraAvailable {
-                Button {
-                    model.toggleInput()
-                } label: {
-                    Label(model.inputMode == .video ? "切换到相机" : "切换到视频测试",
-                          systemImage: model.inputMode == .video ? "camera" : "film")
+    private var controlPanel: some View {
+        VStack(spacing: 10) {
+            Picker("输入源", selection: modeBinding) {
+                ForEach(BoardViewModel.InputMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
                 }
-                .buttonStyle(.borderedProminent)
+            }
+            .pickerStyle(.segmented)
+
+            if model.inputMode == .offline {
+                videoCard
             } else {
-                Label("视频测试模式（无相机）", systemImage: "film")
-                    .font(.caption.weight(.medium))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(.tint.opacity(0.85), in: Capsule())
+                Label("实时相机画面", systemImage: "camera.fill")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.75))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 4)
+            }
+        }
+        .tint(.white)
+        .padding(12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    /// 分段控件的绑定：没有相机时拒绝切到「实时视频」，并给出提示
+    private var modeBinding: Binding<BoardViewModel.InputMode> {
+        Binding(get: { model.inputMode },
+                set: { model.selectMode($0) })
+    }
+
+    /// 离线视频卡片：图标 + 文件名 + 更换按钮
+    private var videoCard: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "play.rectangle.fill")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 38, height: 38)
+                .background(
+                    LinearGradient(colors: [.blue.opacity(0.85), .indigo.opacity(0.85)],
+                                   startPoint: .topLeading, endPoint: .bottomTrailing),
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                )
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("当前素材")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.55))
+                Text(model.videoFileName.isEmpty ? "未选择" : model.videoFileName)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
 
-            // 用自备视频测试
+            Spacer(minLength: 8)
+
             Button {
                 showingVideoPicker = true
             } label: {
-                Label("选择视频…", systemImage: "folder")
+                Label("更换", systemImage: "folder")
+                    .font(.system(size: 12, weight: .semibold))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
             }
-            .buttonStyle(.bordered)
-
-            Spacer()
-
-            Text(model.inputMode == .video ? "离线视频逐帧循环播放" : "实时相机")
-                .font(.caption2)
-                .foregroundStyle(.white.opacity(0.7))
+            .buttonStyle(.plain)
+            .foregroundStyle(.white)
+            .background(.white.opacity(0.16), in: Capsule())
         }
-        .tint(.white)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(.ultraThinMaterial, in: Capsule())
+        .padding(10)
+        .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(.white.opacity(0.12), lineWidth: 1)
+        )
     }
 
     private func chip(_ text: String, systemImage: String) -> some View {
         Label(text, systemImage: systemImage)
-            .font(.caption2.monospacedDigit())
+            .font(.system(size: 11, weight: .medium).monospacedDigit())
+            .foregroundStyle(.white)
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
             .background(.ultraThinMaterial, in: Capsule())

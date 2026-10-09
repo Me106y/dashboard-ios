@@ -19,9 +19,12 @@ final class BoardViewModel: ObservableObject {
     }
 
     /// 当前输入源
-    enum InputMode: String {
-        case video  = "视频"
-        case camera = "相机"
+    enum InputMode: String, CaseIterable, Identifiable {
+        case live    = "实时视频"
+        case offline = "离线视频"
+
+        var id: String { rawValue }
+        var isCamera: Bool { self == .live }
     }
 
     @Published private(set) var status: Status = .preparing("准备中…")
@@ -29,7 +32,9 @@ final class BoardViewModel: ObservableObject {
     @Published private(set) var inferenceMillis: Double = 0
     @Published private(set) var frameMillis: Double = 0
     @Published private(set) var foregroundRatio: Double = 0
-    @Published private(set) var inputMode: InputMode = .video
+    @Published private(set) var inputMode: InputMode = .live
+    /// 当前离线视频的文件名（用于界面展示）
+    @Published private(set) var videoFileName: String = ""
     @Published private(set) var sourceDescription: String = ""
     @Published private(set) var cameraAvailable: Bool = false
 
@@ -62,7 +67,7 @@ final class BoardViewModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] size in
                 guard let self, size.width > 0, size.height > 0,
-                      self.inputMode == .camera, self.currentSource == nil else { return }
+                      self.inputMode.isCamera, self.currentSource == nil else { return }
                 self.build(source: self.camera, size: size)
             }
             .store(in: &cancellables)
@@ -72,40 +77,47 @@ final class BoardViewModel: ObservableObject {
             .sink { [weak self] state in
                 guard let self else { return }
                 switch state {
-                case .unauthorized:    if self.inputMode == .camera { self.status = .failed("未获得相机权限") }
-                case .failed(let msg): if self.inputMode == .camera { self.status = .failed(msg) }
+                case .unauthorized:    if self.inputMode.isCamera { self.status = .failed("未获得相机权限") }
+                case .failed(let msg): if self.inputMode.isCamera { self.status = .failed(msg) }
                 default: break
                 }
             }
             .store(in: &cancellables)
 
+        // 调试用：DB_PICK=<绝对路径> 模拟「文件选择器选了一个视频」，
+        // 走的是与 useCustomVideo 完全相同的导入链路，便于自动化验证。
+        if let path = ProcessInfo.processInfo.environment["DB_PICK"] {
+            useCustomVideo(url: URL(fileURLWithPath: path))
+            return
+        }
+
         // 调试用：DB_SOURCE=video 强制走离线视频（真机默认是相机）
         if ProcessInfo.processInfo.environment["DB_SOURCE"] == "video" {
-            switchToVideo()
+            switchToOfflineVideo()
             return
         }
 
         // 调试用：DB_SOURCE=still 用静态图当输入（用于几何对齐验证，不受视频时间差干扰）
         if ProcessInfo.processInfo.environment["DB_SOURCE"] == "still",
            let still = StillImageFrameSource(device: device, resourceName: "still_sample") {
-            inputMode = .video
+            inputMode = .offline
             sourceDescription = "still_sample.jpg"
             build(source: still, size: still.resolution)
             return
         }
 
-        // 默认输入：有相机用相机，没有（模拟器）直接用内置测试视频
+        // 默认输入：有相机用实时视频，没有（模拟器）直接用内置测试视频
         if cameraAvailable {
-            inputMode = .camera
+            inputMode = .live
             camera.start()
             status = .preparing("启动相机…")
-            // 相机可能不可用（权限被拒等），3 秒内没出画面就回退到视频
+            // 相机可能不可用（权限被拒等），3 秒内没出画面就回退到离线视频
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
                 guard let self, self.currentSource == nil else { return }
-                self.switchToVideo()
+                self.switchToOfflineVideo()
             }
         } else {
-            switchToVideo()
+            switchToOfflineVideo()
         }
     }
 
@@ -121,38 +133,48 @@ final class BoardViewModel: ObservableObject {
         Bundle.main.url(forResource: "sample_whiteboard", withExtension: "mp4")
     }
 
-    /// 顶部按钮：在「离线视频」与「相机」之间切换
-    func toggleInput() {
-        switch inputMode {
-        case .video:
-            guard cameraAvailable else { return }
-            switchToCamera()
-        case .camera:
-            switchToVideo()
+    /// 界面上的「实时视频 / 离线视频」切换
+    func selectMode(_ mode: InputMode) {
+        guard mode != inputMode else { return }
+        if mode == .live && !cameraAvailable {
+            status = .failed("模拟器没有相机，请使用离线视频")
+            return
+        }
+        switch mode {
+        case .live:    switchToLiveCamera()
+        case .offline: switchToOfflineVideo()
         }
     }
 
-    private func switchToVideo() {
+    private func switchToOfflineVideo() {
         guard let url = customVideoURL ?? Self.bundledVideoURL else {
-            status = .failed("找不到测试视频 sample_whiteboard.mp4")
+            status = .failed("找不到内置测试视频 sample_whiteboard.mp4")
             return
         }
-        guard let device = MTLCreateSystemDefaultDevice(),
-              let source = VideoFrameSource(url: url, device: device) else {
-            status = .failed("视频解码器初始化失败")
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            status = .failed("本机没有可用的 Metal 设备")
             return
         }
-        camera.stop()
-        inputMode = .video
-        videoSource = source
-        sourceDescription = url.lastPathComponent
-        build(source: source, size: source.resolution)
+        do {
+            let source = try VideoFrameSource(url: url, device: device)
+            camera.stop()
+            inputMode = .offline
+            videoSource = source
+            videoFileName = url.lastPathComponent
+            sourceDescription = url.lastPathComponent
+            build(source: source, size: source.resolution)
+        } catch {
+            let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            status = .failed("离线视频打开失败：\(reason)")
+            print("[Video] 打开失败 url=\(url.path) error=\(error)")
+        }
     }
 
-    private func switchToCamera() {
+    private func switchToLiveCamera() {
         guard cameraAvailable else { return }
-        inputMode = .camera
+        inputMode = .live
         videoSource = nil
+        videoFileName = ""
         sourceDescription = "后置摄像头"
         currentSource = nil
         status = .preparing("启动相机…")
@@ -163,10 +185,71 @@ final class BoardViewModel: ObservableObject {
         }
     }
 
-    /// 用户自选视频（文件 App / 相册导出的文件）
+    /// 文件选择器失败时给出提示
+    func reportPickerFailure(_ message: String) {
+        status = .failed("选择视频失败：\(message)")
+    }
+
+    /// 用户自选视频。
+    ///
+    /// 文件选择器给的是**安全作用域 URL**，且文件位于临时收件箱：
+    /// 不开启安全作用域就 `fileExists`/读取会失败（表现为"解码器初始化失败"），
+    /// 而且系统随时可能清掉它。所以这里开启作用域、把文件**拷贝进 App 沙盒**再使用。
     func useCustomVideo(url: URL) {
-        customVideoURL = url
-        switchToVideo()
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+
+        do {
+            let localURL = try Self.importVideo(from: url)
+            customVideoURL = localURL
+            print("[Video] 已导入到沙盒: \(localURL.path)")
+            switchToOfflineVideo()
+        } catch {
+            let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            status = .failed("导入视频失败：\(reason)")
+            print("[Video] 导入失败: \(error)")
+        }
+    }
+
+    /// 把外部视频拷贝到 Documents/Videos。
+    ///
+    /// 为什么不直接用选择器给的 URL：
+    /// 1. 那是**安全作用域 URL**，不开作用域连 `fileExists` 都会失败；
+    /// 2. 文件位于临时收件箱，系统随时可能清掉；
+    /// 3. iCloud 上的文件可能还没下载到本地，AVAssetReader 读不了。
+    /// 拷贝这一步同时解决了这三件事（拷贝会强制触发下载/物化）。
+    ///
+    /// 设为 internal 以便单元测试覆盖。
+    static func importVideo(from url: URL, into directory: URL? = nil) throws -> URL {
+        let fileManager = FileManager.default
+        let target = try directory ?? {
+            guard let documents = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first else {
+                throw VideoImportError.noDocumentsDirectory
+            }
+            return documents.appendingPathComponent("Videos", isDirectory: true)
+        }()
+
+        try fileManager.createDirectory(at: target, withIntermediateDirectories: true)
+
+        // 名字：文件选择器偶尔给出没有扩展名的 URL，这里补一个。
+        // mp4/mov 同属 ISO-BMFF 容器，AVFoundation 靠内容嗅探，扩展名只作提示，
+        // 因此统一兜底成 .mov 即可（不要去用 AVURLAsset 的 fileType，那个属性不存在）。
+        var name = url.lastPathComponent
+        if name.isEmpty { name = "imported.mov" }
+        if (name as NSString).pathExtension.isEmpty {
+            name += ".mov"
+        }
+
+        let destination = target.appendingPathComponent(name)
+        if fileManager.fileExists(atPath: destination.path) {
+            try fileManager.removeItem(at: destination)
+        }
+        do {
+            try fileManager.copyItem(at: url, to: destination)
+        } catch {
+            throw VideoImportError.copyFailed(error.localizedDescription)
+        }
+        return destination
     }
 
     // MARK: - 构建
@@ -252,6 +335,18 @@ final class BoardViewModel: ObservableObject {
                 print(String(format: "[STAT] %@ %.1ffps 帧%.1fms 分割%.0fms 前景%.1f%%%@",
                              self.inputMode.rawValue, self.fps, self.frameMillis,
                              self.inferenceMillis, self.foregroundRatio * 100, extra))
+            }
+        }
+    }
+
+    enum VideoImportError: LocalizedError {
+        case noDocumentsDirectory
+        case copyFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .noDocumentsDirectory:    return "找不到可写入的目录"
+            case .copyFailed(let reason):  return "拷贝文件失败：\(reason)"
             }
         }
     }

@@ -7,6 +7,27 @@ import Metal
 /// 用途：没有相机（模拟器）或需要可复现素材时，用固定视频验证整条管线。
 /// 解码出的 `CVPixelBuffer`（BGRA）同样经 `CVMetalTextureCache` 零拷贝成纹理，
 /// 与相机路径共用同一个 `FrameSource` 抽象。
+/// 视频源初始化失败的具体原因（便于给出可操作的提示）
+enum VideoSourceError: LocalizedError {
+    case fileNotFound(String)
+    case textureCacheFailed
+    case permissionDenied
+    case unreadable
+    case noVideoTrack
+    case invalidSize
+
+    var errorDescription: String? {
+        switch self {
+        case .fileNotFound(let name): return "找不到文件 \(name)"
+        case .textureCacheFailed:     return "Metal 纹理缓存创建失败"
+        case .permissionDenied:       return "没有读取该文件的权限"
+        case .unreadable:             return "文件无法读取（可能不是视频，或已被系统清理）"
+        case .noVideoTrack:           return "文件里没有画面轨道（可能只有音频）"
+        case .invalidSize:            return "视频尺寸无效"
+        }
+    }
+}
+
 final class VideoFrameSource: FrameSource {
     let resolution: CGSize
 
@@ -25,22 +46,26 @@ final class VideoFrameSource: FrameSource {
     private(set) var loopCount = 0
     private var didLog = false
 
-    init?(url: URL, device: MTLDevice) {
+    init(url: URL, device: MTLDevice) throws {
+        // isReadableFile 比 fileExists 更能反映「拿不到安全作用域」这类问题
         guard FileManager.default.fileExists(atPath: url.path) else {
-            print("[Video] 文件不存在: \(url.path)")
-            return nil
+            throw VideoSourceError.fileNotFound(url.lastPathComponent)
         }
+        guard FileManager.default.isReadableFile(atPath: url.path) else {
+            throw VideoSourceError.permissionDenied
+        }
+
         var cache: CVMetalTextureCache?
         guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess,
               let cache else {
-            print("[Video] CVMetalTextureCache 创建失败")
-            return nil
+            throw VideoSourceError.textureCacheFailed
         }
 
         // AVFoundation 的轨道加载是异步的；这里同步等一次（只在初始化时发生）
         let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         var loadedTrack: AVAssetTrack?
         var size = CGSize.zero
+        var loadError: Error?
         let semaphore = DispatchSemaphore(value: 0)
         Task {
             do {
@@ -52,15 +77,21 @@ final class VideoFrameSource: FrameSource {
                     size = CGSize(width: abs(transformed.width), height: abs(transformed.height))
                 }
             } catch {
-                print("[Video] 轨道加载失败: \(error)")
+                loadError = error
             }
             semaphore.signal()
         }
         semaphore.wait()
 
-        guard let track = loadedTrack, size.width > 0, size.height > 0 else {
-            print("[Video] 视频没有可用的画面轨道")
-            return nil
+        if let loadError {
+            print("[Video] 轨道加载失败: \(loadError)")
+            throw VideoSourceError.unreadable
+        }
+        guard let track = loadedTrack else {
+            throw VideoSourceError.noVideoTrack
+        }
+        guard size.width > 0, size.height > 0 else {
+            throw VideoSourceError.invalidSize
         }
 
         self.asset = asset
