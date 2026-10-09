@@ -86,9 +86,16 @@ final class BoardViewModel: ObservableObject {
             .sink { [weak self] state in
                 guard let self else { return }
                 switch state {
-                case .unauthorized:    if self.inputMode.isCamera { self.status = .failed("未获得相机权限") }
-                case .failed(let msg): if self.inputMode.isCamera { self.status = .failed(msg) }
-                default: break
+                case .unauthorized:
+                    guard self.inputMode.isCamera, self.currentSource == nil else { return }
+                    self.status = .failed("未获得相机权限，改用离线视频")
+                    self.switchToOfflineVideo()          // 明确被拒 → 回退
+                case .failed(let msg):
+                    guard self.inputMode.isCamera, self.currentSource == nil else { return }
+                    self.status = .failed(msg)
+                    self.switchToOfflineVideo()
+                default:
+                    break
                 }
             }
             .store(in: &cancellables)
@@ -130,9 +137,11 @@ final class BoardViewModel: ObservableObject {
             inputMode = .live
             camera.start()
             status = .preparing("启动相机…")
-            // 相机可能不可用（权限被拒等），3 秒内没出画面就回退到离线视频
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-                guard let self, self.currentSource == nil else { return }
+            // 兜底：只有相机长时间仍无画面（例如被其它 App 占用）才回退到离线视频。
+            // 不能用短计时器——首次安装时权限弹窗还开着，抢跑会让用户以为"默认就是视频"。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+                guard let self, self.currentSource == nil, self.inputMode.isCamera else { return }
+                print("[App] 相机 10s 内未出画面，回退到离线视频")
                 self.switchToOfflineVideo()
             }
         } else {
