@@ -380,9 +380,12 @@ final class BoardViewModel: ObservableObject {
                 if let video = self.videoSource {
                     extra = " 解码\(video.decodedFrames)帧 循环\(video.loopCount)次"
                 }
-                print(String(format: "[STAT] %@ %.1ffps 帧%.1fms 分割%.0fms 前景%.1f%%%@",
+                let age = self.pipeline?.segmentation.lastMaskAgeFrames ?? 0
+                _ = age
+                print(String(format: "[STAT] %@ %.1ffps 帧%.1fms 分割%.0fms 前景%.1f%% mask滞后%.0f帧(峰值%.0f)%@",
                              self.inputMode.rawValue, self.fps, self.frameMillis,
-                             self.inferenceMillis, self.foregroundRatio * 100, extra))
+                             self.inferenceMillis, self.foregroundRatio * 100,
+                             Double(age), Double(self.pipeline?.segmentation.maxMaskAgeFrames ?? 0), extra))
             }
         }
     }

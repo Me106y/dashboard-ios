@@ -91,8 +91,14 @@ enum PipelineBuilder {
         nodes.append(SegmentationPreprocessStage(input: camera, output: segmentInput))
         let segmentation = SegmentationStage(provider: provider, input: segmentInput, output: mask)
         nodes.append(segmentation)
-        // 上游会先膨胀 mask（OpenCVDilateStage，5×5 矩形核）再做时序累积
-        nodes.append(DilateStage(input: mask, output: maskDilated, radius: 2))
+        // 掩膜膨胀（上游 OpenCVDilateStage 的 5×5 矩形核）。
+        //
+        // 注意：上游的膨胀只用来抹掉分割模型的边界误差——因为它是**同步推理、
+        // mask 零帧滞后**。而本移植的分割走后台队列，mask 实测滞后 1 帧，
+        // 人一帧移动 1.5~3.2px（256 尺度），仅 2px 的膨胀盖不住，
+        // 前缘像素会被当成"背景稳定"而把人的边缘写进历史，叠出梳齿状残影。
+        // 因此半径按「滞后 1 帧 × 帧间位移」放大到 5px。
+        nodes.append(DilateStage(input: mask, output: maskDilated, radius: 5))
         nodes.append(AccumulationStage(mask: maskDilated, previous: accA, output: accB, factor: 0.2))
         nodes.append(CopyStage(name: "AccumulationStore", input: accB, output: accA))
         nodes.append(SegmentationPostprocessStage(input: accB, output: maskPost))

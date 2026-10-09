@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DigiBoard iOS — 产品与移植文档 v0.7</title>
+  <title>DigiBoard iOS — 产品与移植文档 v0.8</title>
   <link rel="stylesheet" href="prd-styles.css">
 </head>
 <body>
@@ -42,6 +42,7 @@
         <a href="#device">真机联调记录</a>
         <a href="#video">视频测试与范围收敛</a>
         <a href="#fix-video">选视频问题修复</a>
+        <a href="#ghost">人像边缘叠影修复</a>
         <a href="#changelog">变更记录</a>
       </nav>
       <div class="sidebar-note">
@@ -57,7 +58,7 @@
           <h1>DigiBoard iOS</h1>
           <p class="hero-lead">相机取景 → 人像分割 → 时序背景重建（去遮挡）→ 透视校正 → 图像增强 → 全屏显示。</p>
           <div class="meta-row" aria-label="文档元数据">
-            <span>版本 0.7</span>
+            <span>版本 0.8</span>
             <span>状态：离线视频测试可用 · 选视频问题已修复</span>
             <span>更新：2026-10-08</span>
           </div>
@@ -1138,6 +1139,55 @@
         </article>
       </section>
 
+
+      <section class="doc-section" id="ghost">
+        <div class="section-heading">
+          <h2>人像边缘叠影修复</h2>
+          <p>真机跑用户提供的 <code>2104_raw.MP4</code>（1920×1080 / HEVC Main 10 / HLG HDR / 29.97fps）时，人像边缘出现大量平行条纹状叠影。</p>
+        </div>
+
+        <article class="gate-spec">
+          <header>
+            <div><span class="gate-number">R19</span><h3>排查过程</h3></div>
+            <span class="enforcement-badge">四步定位</span>
+          </header>
+          <div class="table-wrap compact">
+            <table>
+              <thead><tr><th>步骤</th><th>手段</th><th>结论</th></tr></thead>
+              <tbody>
+                <tr><td>1</td><td>抓帧对比 <code>source</code> / <code>mask</code> / <code>stored</code> / <code>cleaned</code></td><td>源帧里人是平滑亮区；历史缓冲里同一区域变成密集梳齿条纹 → <strong>人的边缘被反复写进了历史缓冲</strong></td></tr>
+                <tr><td>2</td><td>把 mask 轮廓叠加到源帧</td><td>mask 只盖住人的右半部分，<strong>左侧前缘完全没被圈住</strong> —— 典型的「mask 落后于人」形状</td></tr>
+                <tr><td>3</td><td>加埋点实测 mask 时效</td><td><strong>滞后 1 帧（峰值 4）</strong>；上游是同步推理，<strong>0 帧滞后</strong></td></tr>
+                <tr><td>4</td><td>离线逐帧跑分割模型量人的速度</td><td><strong>1.5 → 3.2 px/帧</strong>（256×144），折算 1920 宽为 11 → 24 px/帧</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="gate-spec">
+          <header>
+            <div><span class="gate-number">R20</span><h3>根因与修复</h3></div>
+            <span class="enforcement-badge">高频能量降 60%</span>
+          </header>
+          <p><strong>掩膜膨胀不是用来补运动的，它只负责抹掉分割模型的边界误差。</strong>上游 5×5（半径 2px）够用，是因为它同步推理、mask 零帧滞后；本移植为不阻塞渲染把推理放到后台队列，mask 天然滞后 1 帧——而人一帧走 3.2px，2px 的膨胀盖不住，前缘像素被当成「背景稳定」写进历史 → 梳齿状叠影。</p>
+          <p>修复：膨胀半径 <strong>2px → 5px</strong>（覆盖「滞后 1 帧 × 帧间位移」），既保留异步推理的 30fps，又补上滞后量。</p>
+          <div class="table-wrap compact">
+            <table>
+              <thead><tr><th>指标</th><th>修复前（半径 2）</th><th>修复后（半径 5）</th></tr></thead>
+              <tbody>
+                <tr><td>人像区历史缓冲形态</td><td>密集梳齿条纹</td><td><strong>平滑</strong></td></tr>
+                <tr><td>高频能量（梳齿强度）</td><td>6.91</td><td><strong>2.75（降 60%）</strong></td></tr>
+                <tr><td>帧率 / 分割耗时</td><td>30.0fps / 8–9ms</td><td>30.1fps / 7–8ms</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="spec-note">
+            <strong>遗留改进项</strong>
+            <p>mask 滞后是异步推理的固有代价（当前 1 帧）。要彻底归零需像上游那样把「回读 + 推理」插进同一帧内（拆两个命令缓冲并等待），代价是帧率下降。当前用膨胀补偿是更优权衡；若将来遇到更快的人像运动（60fps 素材或快速跑动），可继续加大半径或引入运动方向的自适应膨胀。</p>
+          </div>
+        </article>
+      </section>
+
       <section class="doc-section" id="changelog">
         <div class="section-heading">
           <h2>变更记录</h2>
@@ -1150,6 +1200,11 @@
               <tr><th>版本</th><th>日期</th><th>说明</th></tr>
             </thead>
             <tbody>
+              <tr>
+                <td>v0.8</td>
+                <td>2026-10-09</td>
+                <td><strong>修复人像边缘叠影</strong>：实测出 mask 滞后 1 帧（上游同步推理为 0 帧）而人每帧移动 3.2px，2px 的膨胀盖不住 → 边缘被写进历史缓冲形成梳齿状叠影；膨胀半径 2→5 后高频能量降 60%，帧率仍 30fps</td>
+              </tr>
               <tr>
                 <td>v0.7</td>
                 <td>2026-10-09</td>
@@ -1196,7 +1251,7 @@
           </div>
           <div>
             <strong>审核状态</strong>
-            <span>离线视频测试可用，选视频问题已修复</span>
+            <span>人像边缘叠影已修复</span>
           </div>
           <div>
             <strong>下次更新</strong>
@@ -1210,7 +1265,7 @@
   <button class="back-to-top" id="back-to-top" aria-label="回到顶部">↑</button>
 
   <footer>
-    <p>DigiBoard · iOS 版 · 产品与移植文档 v0.7</p>
+    <p>DigiBoard · iOS 版 · 产品与移植文档 v0.8</p>
     <p>2026-10-08</p>
   </footer>
 

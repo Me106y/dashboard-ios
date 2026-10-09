@@ -34,6 +34,12 @@ final class SegmentationStage: TextureProducer, TextureConsumer {
     private var frameCounter = 0
 
     private(set) var lastInferenceMillis: Double = 0
+    /// 诊断：mask 从「回读输入」到「上屏生效」隔了几帧。
+    /// 上游是同步推理（0 帧延迟），若这里明显 >0，快移人像的边缘就会漏出遮罩。
+    private var produceTick = 0
+    private var maskBirthTick = 0
+    private(set) var lastMaskAgeFrames = 0
+    private(set) var maxMaskAgeFrames = 0
     private(set) var lastForegroundRatio: Double = 0
     private(set) var inferenceCount = 0
 
@@ -45,6 +51,9 @@ final class SegmentationStage: TextureProducer, TextureConsumer {
 
     // MARK: - 回读（渲染完成回调，非渲染线程）
 
+    /// 本次回读对应的渲染帧序号（用于计算 mask 时效）
+    private var tickAtRequest = 0
+
     func consume(_ bytes: UnsafeRawBufferPointer, width: Int, height: Int, bytesPerRow: Int) {
         frameCounter += 1
         guard frameCounter % max(frameInterval, 1) == 0 else { return }
@@ -53,6 +62,9 @@ final class SegmentationStage: TextureProducer, TextureConsumer {
         let busy = isInferring
         lock.unlock()
         guard !busy else { return }
+
+        // 记录这次回读对应的渲染帧号，用于统计 mask 从回读到生效隔了几帧
+        tickAtRequest = produceTick
 
         guard let image = Self.makeImage(from: bytes, width: width, height: height, bytesPerRow: bytesPerRow) else {
             return
@@ -88,7 +100,10 @@ final class SegmentationStage: TextureProducer, TextureConsumer {
                 self.lastInferenceMillis = (CACurrentMediaTime() - start) * 1000
                 self.lastForegroundRatio = mask.foregroundRatio
                 self.inferenceCount += 1
-                self.lock.lock(); self.latestMask = mask; self.lock.unlock()
+                self.lock.lock()
+                self.latestMask = mask
+                self.maskBirthTick = self.tickAtRequest
+                self.lock.unlock()
             } catch {
                 print("[Segmentation] 推理失败: \(error)")
             }
@@ -99,12 +114,17 @@ final class SegmentationStage: TextureProducer, TextureConsumer {
     // MARK: - 回填（渲染线程）
 
     func produce(_ ctx: FrameContext, texture: MTLTexture) throws {
+        produceTick += 1
+
         lock.lock()
         let mask = latestMask
+        let birth = maskBirthTick
         latestMask = nil
         lock.unlock()
 
         guard let mask else { return }
+        lastMaskAgeFrames = max(produceTick - birth, 0)
+        maxMaskAgeFrames = max(maxMaskAgeFrames, lastMaskAgeFrames)
         upload(mask, into: texture)
     }
 
