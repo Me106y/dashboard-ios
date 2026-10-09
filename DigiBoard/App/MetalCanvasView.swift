@@ -24,6 +24,11 @@ struct MetalCanvasView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: MTKView, context: Context) {
+        // Renderer 是 MTKView 的 weak delegate：切换输入源会换一个 Renderer，
+        // 这里必须重新绑定，否则旧 Renderer 释放后 delegate 变 nil，画面直接停住。
+        if uiView.delegate !== renderer {
+            uiView.delegate = renderer
+        }
         uiView.preferredFramesPerSecond = preferredFPS
     }
 }

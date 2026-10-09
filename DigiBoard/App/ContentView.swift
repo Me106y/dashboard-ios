@@ -82,6 +82,7 @@ struct ContentView: View {
                 }
             }
             .pickerStyle(.segmented)
+            .disabled(model.isImporting)
 
             if model.inputMode == .offline {
                 videoCard
@@ -104,21 +105,28 @@ struct ContentView: View {
                 set: { model.selectMode($0) })
     }
 
-    /// 离线视频卡片：图标 + 文件名 + 更换按钮
+    /// 离线视频卡片：图标 + 文件名 + 更换按钮（导入中显示进度）
     private var videoCard: some View {
         HStack(spacing: 12) {
-            Image(systemName: "play.rectangle.fill")
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 38, height: 38)
-                .background(
-                    LinearGradient(colors: [.blue.opacity(0.85), .indigo.opacity(0.85)],
-                                   startPoint: .topLeading, endPoint: .bottomTrailing),
-                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                )
+            ZStack {
+                if model.isImporting {
+                    ProgressView()
+                        .tint(.white)
+                } else {
+                    Image(systemName: "play.rectangle.fill")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+            }
+            .frame(width: 38, height: 38)
+            .background(
+                LinearGradient(colors: [.blue.opacity(0.85), .indigo.opacity(0.85)],
+                               startPoint: .topLeading, endPoint: .bottomTrailing),
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("当前素材")
+                Text(model.isImporting ? "正在导入…" : "当前素材")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.white.opacity(0.55))
                 Text(model.videoFileName.isEmpty ? "未选择" : model.videoFileName)
@@ -133,14 +141,16 @@ struct ContentView: View {
             Button {
                 showingVideoPicker = true
             } label: {
-                Label("更换", systemImage: "folder")
+                Label(model.isImporting ? "导入中" : "更换",
+                      systemImage: model.isImporting ? "hourglass" : "folder")
                     .font(.system(size: 12, weight: .semibold))
                     .padding(.horizontal, 12)
                     .padding(.vertical, 7)
             }
             .buttonStyle(.plain)
             .foregroundStyle(.white)
-            .background(.white.opacity(0.16), in: Capsule())
+            .background(.white.opacity(model.isImporting ? 0.08 : 0.16), in: Capsule())
+            .disabled(model.isImporting)
         }
         .padding(10)
         .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14, style: .continuous))

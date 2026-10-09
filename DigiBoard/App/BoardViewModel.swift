@@ -35,10 +35,14 @@ final class BoardViewModel: ObservableObject {
     @Published private(set) var inputMode: InputMode = .live
     /// 当前离线视频的文件名（用于界面展示）
     @Published private(set) var videoFileName: String = ""
+    /// 正在导入 / 打开离线视频（期间界面显示进度，避免"卡住"的错觉）
+    @Published private(set) var isImporting = false
     @Published private(set) var sourceDescription: String = ""
     @Published private(set) var cameraAvailable: Bool = false
 
-    private(set) var renderer: Renderer?
+    /// 必须是 @Published：切换输入源时会重建 Renderer，
+    /// 不发布的话 SwiftUI 不会刷新画布，MTKView 会一直指着被释放的旧 Renderer。
+    @Published private(set) var renderer: Renderer?
 
     private let camera: CameraFrameSource
     private var videoSource: VideoFrameSource?
@@ -92,8 +96,18 @@ final class BoardViewModel: ObservableObject {
         // 调试用：DB_PICK=<绝对路径> 模拟「文件选择器选了一个视频」，
         // 走的是与 useCustomVideo 完全相同的导入链路，便于自动化验证。
         if let path = ProcessInfo.processInfo.environment["DB_PICK"] {
-            useCustomVideo(url: URL(fileURLWithPath: path))
-            return
+            // DB_PICK_DELAY>0 时先正常启动，N 秒后再触发导入，
+            // 便于观察「导入大文件期间渲染循环是否仍在跑」
+            let delay = Double(ProcessInfo.processInfo.environment["DB_PICK_DELAY"] ?? "") ?? 0
+            if delay > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    print("[Video] 触发延迟导入（\(Int(delay))s）")
+                    self?.useCustomVideo(url: URL(fileURLWithPath: path))
+                }
+            } else {
+                useCustomVideo(url: URL(fileURLWithPath: path))
+                return
+            }
         }
 
         // 调试用：DB_SOURCE=video 强制走离线视频（真机默认是相机）
@@ -156,27 +170,11 @@ final class BoardViewModel: ObservableObject {
             status = .failed("找不到内置测试视频 sample_whiteboard.mp4")
             return
         }
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            status = .failed("本机没有可用的 Metal 设备")
-            return
-        }
-        do {
-            let source = try VideoFrameSource(url: url, device: device)
-            camera.stop()
-            inputMode = .offline
-            videoSource = source
-            videoFileName = url.lastPathComponent
-            sourceDescription = url.lastPathComponent
-            build(source: source, size: source.resolution)
-        } catch {
-            let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            status = .failed("离线视频打开失败：\(reason)")
-            print("[Video] 打开失败 url=\(url.path) error=\(error)")
-        }
+        prepareOfflineVideo(url: url, isUserImport: false)
     }
 
     private func switchToLiveCamera() {
-        guard cameraAvailable else { return }
+        guard cameraAvailable, !isImporting else { return }
         inputMode = .live
         videoSource = nil
         videoFileName = ""
@@ -190,30 +188,62 @@ final class BoardViewModel: ObservableObject {
         }
     }
 
+    /// 统一的离线视频装载。
+    ///
+    /// **全部放到后台**：用户选的 raw 录像可能有几百 MB ~ 几 GB，若还在 iCloud Drive
+    /// 里没下载，`copyItem` 会先同步触发整个下载——在主线程做这件事就是几十秒的假死
+    /// （用户报的"卡住"）。解码器初始化（`AVURLAsset.loadTracks`）同理。
+    private func prepareOfflineVideo(url: URL, isUserImport: Bool) {
+        guard !isImporting else { return }
+        isImporting = true
+        status = .preparing(isUserImport ? "正在导入 \(url.lastPathComponent)…" : "正在打开测试视频…")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                var videoURL = url
+                if isUserImport {
+                    // 安全作用域必须在访问文件之前开启，且覆盖整个拷贝过程
+                    let scoped = url.startAccessingSecurityScopedResource()
+                    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                    videoURL = try Self.importVideo(from: url)
+                }
+
+                guard let device = MTLCreateSystemDefaultDevice() else {
+                    throw VideoSourceError.textureCacheFailed
+                }
+                let source = try VideoFrameSource(url: videoURL, device: device)
+
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.isImporting = false
+                    if isUserImport { self.customVideoURL = videoURL }
+                    self.inputMode = .offline
+                    self.videoSource = source
+                    self.videoFileName = videoURL.lastPathComponent
+                    self.sourceDescription = videoURL.lastPathComponent
+                    self.camera.stop()
+                    self.build(source: source, size: source.resolution)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.isImporting = false
+                    let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    self.status = .failed(isUserImport ? "导入视频失败：\(reason)" : "离线视频打开失败：\(reason)")
+                    print("[Video] 失败: \(error)")
+                }
+            }
+        }
+    }
+
     /// 文件选择器失败时给出提示
     func reportPickerFailure(_ message: String) {
         status = .failed("选择视频失败：\(message)")
     }
 
-    /// 用户自选视频。
-    ///
-    /// 文件选择器给的是**安全作用域 URL**，且文件位于临时收件箱：
-    /// 不开启安全作用域就 `fileExists`/读取会失败（表现为"解码器初始化失败"），
-    /// 而且系统随时可能清掉它。所以这里开启作用域、把文件**拷贝进 App 沙盒**再使用。
+    /// 用户自选视频。真正的导入放在后台，界面立刻响应并显示进度。
     func useCustomVideo(url: URL) {
-        let scoped = url.startAccessingSecurityScopedResource()
-        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-
-        do {
-            let localURL = try Self.importVideo(from: url)
-            customVideoURL = localURL
-            print("[Video] 已导入到沙盒: \(localURL.path)")
-            switchToOfflineVideo()
-        } catch {
-            let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            status = .failed("导入视频失败：\(reason)")
-            print("[Video] 导入失败: \(error)")
-        }
+        prepareOfflineVideo(url: url, isUserImport: true)
     }
 
     /// 把外部视频拷贝到 Documents/Videos。
@@ -271,8 +301,11 @@ final class BoardViewModel: ObservableObject {
 
         do {
             let provider = try CoreMLSegmentationProvider(modelURL: modelURL)
+            // 兜底：超大素材（8K raw 等）按比例缩到长边 ≤ 3840，
+            // 否则纹理与每帧开销会随分辨率线性膨胀
+            let pipelineSize = Self.capped(size, maxLongEdge: 3840)
             let pipeline = PipelineBuilder.build(source: source,
-                                                 sourceSize: size,
+                                                 sourceSize: pipelineSize,
                                                  provider: provider)
             guard let renderer = Renderer(nodes: pipeline.nodes) else {
                 status = .failed("Metal 初始化失败")
@@ -312,7 +345,8 @@ final class BoardViewModel: ObservableObject {
                 }
             }
 
-            print("[PIPE] 输入=\(inputMode.rawValue) \(Int(size.width))x\(Int(size.height))，"
+            print("[PIPE] 输入=\(inputMode.rawValue) 源\(Int(size.width))x\(Int(size.height)) "
+                  + "管线\(Int(pipelineSize.width))x\(Int(pipelineSize.height))，"
                   + "分割输入 \(provider.inputWidth)x\(provider.inputHeight)，节点 \(pipeline.nodes.count)")
 
             startStatsPolling()
@@ -354,6 +388,14 @@ final class BoardViewModel: ObservableObject {
             case .copyFailed(let reason):  return "拷贝文件失败：\(reason)"
             }
         }
+    }
+
+    /// 按长边上限等比缩放
+    private static func capped(_ size: CGSize, maxLongEdge: CGFloat) -> CGSize {
+        let longEdge = max(size.width, size.height)
+        guard longEdge > maxLongEdge, longEdge > 0 else { return size }
+        let scale = maxLongEdge / longEdge
+        return CGSize(width: (size.width * scale).rounded(), height: (size.height * scale).rounded())
     }
 
     private static func locateSegmentationModel() -> URL? {
