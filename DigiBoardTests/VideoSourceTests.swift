@@ -32,8 +32,13 @@ final class VideoSourceTests: XCTestCase {
         let url = try XCTUnwrap(Bundle.main.url(forResource: "sample_whiteboard", withExtension: "mp4"),
                                 "内置测试视频缺失")
         let source = try VideoFrameSource(url: url, device: device)
-        XCTAssertEqual(source.resolution.width, 1280, accuracy: 1)
-        XCTAssertEqual(source.resolution.height, 720, accuracy: 1)
+        // 不写死分辨率：素材会被替换（当前是真实拍摄的 1920x1080 HLG 素材），
+        // 只校验"有画面 + 是常见横向比例"
+        XCTAssertGreaterThan(source.resolution.width, 320)
+        XCTAssertGreaterThan(source.resolution.height, 180)
+        let aspect = source.resolution.width / source.resolution.height
+        XCTAssertEqual(aspect, 16.0 / 9.0, accuracy: 0.05,
+                       "内置素材应为横向 16:9，实际 \(source.resolution)")
 
         // 推进若干帧后应当拿到纹理
         for _ in 0..<3 { source.advance() }

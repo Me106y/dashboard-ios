@@ -55,7 +55,8 @@ scripts/.venv/bin/python scripts/assets/make_app_icon.py
 
 ### 视频测试
 
-内置测试素材 `DigiBoard/Resources/sample_whiteboard.mp4`（真人横向走过带笔迹的白板，6 秒循环）。
+内置测试素材 `DigiBoard/Resources/sample_whiteboard.mp4`
+（真实拍摄：1920×1080 / HEVC Main 10 / HLG / 29.97fps / 7.54s，讲解者在白板前走动）。
 也可以点卡片上的「更换」导入自备视频；导入的文件会被拷贝到 App 沙盒，不受文件选择器
 安全作用域与临时收件箱的影响。模拟器直接运行即可看到完整效果：
 

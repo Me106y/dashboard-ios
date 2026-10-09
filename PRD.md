@@ -549,8 +549,12 @@ extension PipelineNode {
 
 ### 16.2 测试素材
 
-上游 README 的演示视频（`youtu.be/U0TRvTYuAUQ`）已不可访问，因此自制素材
-`DigiBoard/Resources/sample_whiteboard.mp4`（1280×720 / 30fps / 6s）：
+**当前内置素材**：`DigiBoard/Resources/sample_whiteboard.mp4` 已替换为**真实拍摄**素材
+（1920×1080 / HEVC Main 10 / HLG HDR / 29.97fps / 7.54s，讲解者在白板前走动）——
+实测人像约占画面 21~24%，帧间位移 1.5~3.2px（256 尺度），是比合成素材更严苛的验证用例。
+
+> 以下为最初使用的**合成素材**（`scripts/model-convert/04_make_test_video.py` 可复现），
+> 保留为备选方案：
 
 1. 用 P0 的 ONNX 分割模型把 `infront.jpg` 里的人抠出来（带 alpha）
 2. 合成到静止的 `whiteboard.jpg` 背景上
