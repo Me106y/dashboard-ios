@@ -32,6 +32,14 @@ final class BoardViewModel: ObservableObject {
     @Published private(set) var inferenceMillis: Double = 0
     @Published private(set) var frameMillis: Double = 0
     @Published private(set) var foregroundRatio: Double = 0
+    // 运行时资源（与 fps 同一轮轮询采样）：内存 / 可用内存 / CPU / 热状态 / 电量
+    @Published private(set) var residentMemoryMB: Double = 0
+    @Published private(set) var availableMemoryMB: Double = -1
+    @Published private(set) var cpuPercent: Double = 0
+    @Published private(set) var thermalStateText: String = "正常"
+    @Published private(set) var batteryLevel: Float = -1
+    /// 整机耗电速率（%/小时），样本不足时为 -1
+    @Published private(set) var batteryDrainPerHour: Double = -1
     @Published private(set) var inputMode: InputMode = .live
     /// 当前离线视频的文件名（用于界面展示）
     @Published private(set) var videoFileName: String = ""
@@ -50,6 +58,8 @@ final class BoardViewModel: ObservableObject {
     private var pipeline: FullPipeline?
     private var cancellables = Set<AnyCancellable>()
     private var statsTimer: Timer?
+    /// 移动端部署指标：内存 / 热状态 / 耗电 / CPU
+    private let deviceStats = DeviceStats()
     private var currentSource: FrameSource?
     private var isBuilding = false
 
@@ -375,6 +385,13 @@ final class BoardViewModel: ObservableObject {
             self.frameMillis = self.renderer?.stats.lastFrameMillis ?? 0
             self.inferenceMillis = self.pipeline?.segmentation.lastInferenceMillis ?? 0
             self.foregroundRatio = self.pipeline?.segmentation.lastForegroundRatio ?? 0
+            let device = self.deviceStats.sample()
+            self.residentMemoryMB = device.residentMB
+            self.availableMemoryMB = device.availableMB
+            self.cpuPercent = device.cpuPercent
+            self.thermalStateText = self.deviceStats.thermalStateText
+            self.batteryLevel = device.batteryLevel
+            self.batteryDrainPerHour = device.batteryDrainPercentPerHour
             if tick % 4 == 0 {
                 var extra = ""
                 if let video = self.videoSource {
@@ -382,10 +399,19 @@ final class BoardViewModel: ObservableObject {
                 }
                 let age = self.pipeline?.segmentation.lastMaskAgeFrames ?? 0
                 _ = age
-                print(String(format: "[STAT] %@ %.1ffps 帧%.1fms 分割%.0fms 前景%.1f%% mask滞后%.0f帧(峰值%.0f)%@",
+                var power = String(format: "内存%.0fMB 可用%.0fMB CPU%.0f%% 热%@",
+                                   device.residentMB, device.availableMB,
+                                   device.cpuPercent, self.deviceStats.thermalStateText)
+                if device.batteryLevel >= 0 {
+                    power += String(format: " 电量%.0f%%", device.batteryLevel * 100)
+                    if device.batteryDrainPercentPerHour > 0 {
+                        power += String(format: " 耗电%.1f%%/h", device.batteryDrainPercentPerHour)
+                    }
+                }
+                print(String(format: "[STAT] %@ %.1ffps 帧%.1fms 分割%.0fms 前景%.1f%% mask滞后%.0f帧(峰值%.0f) %@%@",
                              self.inputMode.rawValue, self.fps, self.frameMillis,
                              self.inferenceMillis, self.foregroundRatio * 100,
-                             Double(age), Double(self.pipeline?.segmentation.maxMaskAgeFrames ?? 0), extra))
+                             Double(age), Double(self.pipeline?.segmentation.maxMaskAgeFrames ?? 0), power, extra))
             }
         }
     }

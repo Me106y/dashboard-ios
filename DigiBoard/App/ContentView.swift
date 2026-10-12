@@ -63,20 +63,35 @@ struct ContentView: View {
     // MARK: - 顶部状态条
 
     private var statusBar: some View {
-        HStack(spacing: 9) {
-            chip(statusText, systemImage: "video.fill")
-            if model.fps > 0 {
-                chip(String(format: "%.0f fps", model.fps), systemImage: "speedometer")
+        // 指标变多后在窄屏会溢出，改为横向可滚动，保证每一项都能看到
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 9) {
+                chip(statusText, systemImage: "video.fill")
+                if model.fps > 0 {
+                    chip(String(format: "%.0f fps", model.fps), systemImage: "speedometer")
+                }
+                if model.inferenceMillis > 0 {
+                    chip(String(format: "分割 %.0f ms", model.inferenceMillis),
+                         systemImage: "person.crop.rectangle")
+                }
+                if model.foregroundRatio > 0 {
+                    chip(String(format: "人像 %.0f%%", model.foregroundRatio * 100),
+                         systemImage: "figure.stand")
+                }
+                // 移动端部署指标：内存 / CPU / 热状态 / 电量
+                if model.residentMemoryMB > 0 {
+                    chip(String(format: "内存 %.0f MB", model.residentMemoryMB),
+                         systemImage: "memorychip")
+                }
+                if model.cpuPercent > 0 {
+                    chip(String(format: "CPU %.0f%%", model.cpuPercent), systemImage: "cpu")
+                }
+                chip("热 \(model.thermalStateText)", systemImage: "thermometer.medium")
+                if model.batteryLevel >= 0 {
+                    chip(String(format: "电量 %.0f%%", model.batteryLevel * 100),
+                         systemImage: "battery.75")
+                }
             }
-            if model.inferenceMillis > 0 {
-                chip(String(format: "分割 %.0f ms", model.inferenceMillis),
-                     systemImage: "person.crop.rectangle")
-            }
-            if model.foregroundRatio > 0 {
-                chip(String(format: "人像 %.0f%%", model.foregroundRatio * 100),
-                     systemImage: "figure.stand")
-            }
-            Spacer(minLength: 0)
         }
     }
 

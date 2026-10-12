@@ -20,13 +20,15 @@ enum FrameCapture {
         return documents.appendingPathComponent(fileName)
     }
 
-    /// 把已经 blit 到 shared 暂存纹理的内容写成 PNG（RGB8）。
-    /// blit 由 Renderer 在帧内完成，这里只做回读与编码。
-    @discardableResult
-    static func write(staging: MTLTexture, to url: URL) -> Bool {
+    /// 把已经 blit 到 shared 暂存纹理的内容回读成 `CGImage`。
+    /// blit 由 Renderer 在帧内完成，这里只做回读与色彩重排（RGB8）。
+    ///
+    /// 除了写 PNG，另一个用途是喂给 `RestorationMetrics`：拿恢复输出与干净参考帧各回读
+    /// 一张，即可算恢复质量的 PSNR / SSIM。
+    static func makeImage(from staging: MTLTexture) -> CGImage? {
         let width = staging.width
         let height = staging.height
-        guard width > 0, height > 0 else { return false }
+        guard width > 0, height > 0 else { return nil }
 
         // 必须按纹理的实际像素格式决定每行字节数：
         // r8Unorm 是每像素 1 字节，按 4 字节读会读到错位数据
@@ -66,18 +68,24 @@ enum FrameCapture {
         }
         let bytesPerRow = width * 4
 
-        guard let provider = CGDataProvider(data: Data(rgba) as CFData),
-              let image = CGImage(width: width,
-                                  height: height,
-                                  bitsPerComponent: 8,
-                                  bitsPerPixel: 32,
-                                  bytesPerRow: bytesPerRow,
-                                  space: CGColorSpaceCreateDeviceRGB(),
-                                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
-                                  provider: provider,
-                                  decode: nil,
-                                  shouldInterpolate: false,
-                                  intent: .defaultIntent),
+        guard let provider = CGDataProvider(data: Data(rgba) as CFData) else { return nil }
+        return CGImage(width: width,
+                       height: height,
+                       bitsPerComponent: 8,
+                       bitsPerPixel: 32,
+                       bytesPerRow: bytesPerRow,
+                       space: CGColorSpaceCreateDeviceRGB(),
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                       provider: provider,
+                       decode: nil,
+                       shouldInterpolate: false,
+                       intent: .defaultIntent)
+    }
+
+    /// 把暂存纹理写成 PNG（调试期抓帧用）。
+    @discardableResult
+    static func write(staging: MTLTexture, to url: URL) -> Bool {
+        guard let image = makeImage(from: staging),
               let destination = CGImageDestinationCreateWithURL(url as CFURL,
                                                                 UTType.png.identifier as CFString,
                                                                 1, nil) else {
