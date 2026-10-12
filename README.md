@@ -114,4 +114,10 @@ PRD.md / PRD.html       本文档
 
 ## 许可
 
-上游项目为 Apache 2.0，本移植版沿用同一许可。
+本移植版基于对上游 [Me106y/DigiBoard](https://github.com/Me106y/DigiBoard) 的重写。
+
+上游的许可声明**自身存在矛盾**：README 与徽章写的是 Apache 2.0，链接指向根目录的
+`LICENSE`，但该文件并不存在；而 `WhiteboardApp-main/LICENSE` 的实际内容是
+**GNU GPL v3**。
+
+本仓库**暂未附许可文件**，待按上游实际情况确认后再补。在此之前默认保留所有权利。
