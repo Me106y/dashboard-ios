@@ -2,7 +2,12 @@ import AVFoundation
 import CoreVideo
 import Metal
 
-/// 离线视频帧源：把一段本地视频逐帧喂进管线，循环播放。
+/// 离线视频帧源：把一段本地视频逐帧喂进管线。
+///
+/// 两种播放方式：
+/// - `loops = true`（默认）：到尾部自动重开 reader 循环播放，「离线视频」模式用；
+/// - `loops = false`：放完停在最后一帧并回调 `onFinished`，「调试模式」用——
+///   调试模式要的是「跑完一遍 → 出报告」，循环会让它永远跑不到终点。
 ///
 /// 用途：没有相机（模拟器）或需要可复现素材时，用固定视频验证整条管线。
 /// 解码出的 `CVPixelBuffer`（BGRA）同样经 `CVMetalTextureCache` 零拷贝成纹理，
@@ -44,9 +49,18 @@ final class VideoFrameSource: FrameSource {
 
     private(set) var decodedFrames = 0
     private(set) var loopCount = 0
+    /// 非循环播放到尾部后置为 true；此后 `advance()` 变成空操作，停在最后一帧
+    private(set) var isFinished = false
+    /// 视频总帧数（按时长 × 标称帧率估算），用于调试模式的进度条；拿不到时为 0
+    private(set) var estimatedFrames = 0
     private var didLog = false
 
-    init(url: URL, device: MTLDevice) throws {
+    /// 是否循环播放（默认 true，保持既有行为）
+    private let loops: Bool
+    /// 非循环播放到尾部时的回调。在主线程调用，且只调用一次。
+    var onFinished: (() -> Void)?
+
+    init(url: URL, device: MTLDevice, loops: Bool = true) throws {
         // isReadableFile 比 fileExists 更能反映「拿不到安全作用域」这类问题
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw VideoSourceError.fileNotFound(url.lastPathComponent)
@@ -65,6 +79,7 @@ final class VideoFrameSource: FrameSource {
         let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         var loadedTrack: AVAssetTrack?
         var size = CGSize.zero
+        var frameEstimate = 0
         var loadError: Error?
         let semaphore = DispatchSemaphore(value: 0)
         Task {
@@ -75,6 +90,14 @@ final class VideoFrameSource: FrameSource {
                     let transform = try await track.load(.preferredTransform)
                     let transformed = natural.applying(transform)
                     size = CGSize(width: abs(transformed.width), height: abs(transformed.height))
+
+                    // 进度条用的总帧数：时长 × 标称帧率（29.97fps 这类也能算）
+                    let rate = try await track.load(.nominalFrameRate)
+                    let duration = try await asset.load(.duration)
+                    let seconds = duration.seconds
+                    if rate > 0, seconds.isFinite, seconds > 0 {
+                        frameEstimate = max(1, Int((seconds * Double(rate)).rounded()))
+                    }
                 }
             } catch {
                 loadError = error
@@ -98,12 +121,18 @@ final class VideoFrameSource: FrameSource {
         self.track = track
         self.textureCache = cache
         self.resolution = size
+        self.loops = loops
+        self.estimatedFrames = frameEstimate
     }
 
-    /// 每帧推进：取下一张样本；到尾部自动重开 reader 循环播放。
+    /// 每帧推进：取下一张样本。
+    /// 循环模式下到尾部自动重开 reader；非循环模式下到尾部标记结束并回调 `onFinished`。
     func advance() {
         lock.lock()
         defer { lock.unlock() }
+
+        // 已放完：停在最后一帧，不再解码（调试模式靠这个「冻结」在终帧）
+        guard !isFinished else { return }
 
         if trackOutput == nil || reader?.status != .reading {
             restartReader()
@@ -111,7 +140,15 @@ final class VideoFrameSource: FrameSource {
         guard let output = trackOutput,
               let sample = output.copyNextSampleBuffer(),
               let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else {
-            restartReader()
+            if loops {
+                restartReader()
+            } else if decodedFrames > 0 {
+                finishLocked()
+            } else {
+                // 一帧都没解出来就失败：不要立刻判定「播放结束」，
+                // 否则调试模式会在第一帧就弹出一份空报告
+                print("[Video] 首帧解码失败（reader 状态 \(String(describing: reader?.status))）")
+            }
             return
         }
 
@@ -129,8 +166,36 @@ final class VideoFrameSource: FrameSource {
         return current
     }
 
+    /// 从头再放一遍（调试模式的「重新播放」）。
+    ///
+    /// 调用方需要同时重建管线：`AccumulationStage` / `stored` 这些持久纹理里
+    /// 还留着上一轮的时序状态，只重置解码器会让第二遍从「上一轮的残留」开始。
+    func rewindAndRestart() {
+        lock.lock()
+        defer { lock.unlock() }
+        isFinished = false
+        decodedFrames = 0
+        loopCount = 0
+        restartReader()
+    }
+
     // MARK: - 内部
 
+    /// 非循环播放到尾部：只标记一次，并在主线程回调。
+    ///
+    /// 注意：必须在持有 `lock` 时调用（`advance()` 已持锁），
+    /// 回调本身 dispatch 到主线程，不会在锁内执行用户代码。
+    private func finishLocked() {
+        guard !isFinished else { return }
+        isFinished = true
+        reader?.cancelReading()
+        reader = nil
+        trackOutput = nil
+        let callback = onFinished
+        DispatchQueue.main.async { callback?() }
+    }
+
+    /// 重开 reader。**调用前必须持有 `lock`**（`advance()` / `rewindAndRestart()` 都持锁）。
     private func restartReader() {
         reader?.cancelReading()
         reader = nil

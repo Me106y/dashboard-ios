@@ -22,9 +22,21 @@ final class BoardViewModel: ObservableObject {
     enum InputMode: String, CaseIterable, Identifiable {
         case live    = "实时视频"
         case offline = "离线视频"
+        case debug   = "调试模式"
 
         var id: String { rawValue }
         var isCamera: Bool { self == .live }
+        /// 后两者都用本地视频文件
+        var usesVideo: Bool { self != .live }
+        /// 调试模式：不循环播放 → 放完出资源报告 → 可把处理后的视频存进相册
+        var isDebug: Bool { self == .debug }
+    }
+
+    /// 调试模式的运行阶段
+    enum DebugPhase: Equatable {
+        case idle
+        case running
+        case finished
     }
 
     @Published private(set) var status: Status = .preparing("准备中…")
@@ -52,6 +64,26 @@ final class BoardViewModel: ObservableObject {
     /// 不发布的话 SwiftUI 不会刷新画布，MTKView 会一直指着被释放的旧 Renderer。
     @Published private(set) var renderer: Renderer?
 
+    // MARK: - 调试模式状态
+
+    @Published private(set) var debugPhase: DebugPhase = .idle
+    /// 播放进度 0…1
+    @Published private(set) var debugProgress: Double = 0
+    /// 放完一遍后的运行报告（nil = 还没有）
+    @Published private(set) var report: RunReport?
+    /// 是否弹出报告卡片（可写，供 sheet 关闭）
+    @Published var isReportPresented = false
+    /// 本次跑测是否顺带录制「处理后的视频」
+    @Published var isRecordingProcessedVideo = true
+    /// 录制产物（本地临时文件），可直接存进相册
+    @Published private(set) var processedVideoURL: URL?
+    /// 报告明细 CSV（落在沙盒 Documents，可用 devicectl 拉回本机分析）
+    @Published private(set) var reportCSVURL: URL?
+    @Published private(set) var isSavingVideo = false
+    @Published private(set) var saveVideoMessage: String?
+    /// 画布是否暂停（放完后停在终帧）
+    @Published private(set) var canvasPaused = false
+
     private let camera: CameraFrameSource
     private var videoSource: VideoFrameSource?
     private var customVideoURL: URL?
@@ -60,6 +92,9 @@ final class BoardViewModel: ObservableObject {
     private var statsTimer: Timer?
     /// 移动端部署指标：内存 / 热状态 / 耗电 / CPU
     private let deviceStats = DeviceStats()
+    /// 调试模式的采样记录
+    private let recorder = RunRecorder()
+    private var exportWriter: ProcessedVideoWriter?
     private var currentSource: FrameSource?
     private var isBuilding = false
 
@@ -175,12 +210,15 @@ final class BoardViewModel: ObservableObject {
     func selectMode(_ mode: InputMode) {
         guard mode != inputMode else { return }
         if mode == .live && !cameraAvailable {
-            status = .failed("模拟器没有相机，请使用离线视频")
+            status = .failed("模拟器没有相机，请使用离线视频或调试模式")
             return
         }
+        // 离开调试模式时把报告、录制器等一并收掉，避免残留状态影响下一种输入
+        if !mode.isDebug { resetDebugState() }
         switch mode {
         case .live:    switchToLiveCamera()
         case .offline: switchToOfflineVideo()
+        case .debug:   switchToDebugVideo()
         }
     }
 
@@ -189,7 +227,16 @@ final class BoardViewModel: ObservableObject {
             status = .failed("找不到内置测试视频 sample_whiteboard.mp4")
             return
         }
-        prepareOfflineVideo(url: url, isUserImport: false)
+        prepareOfflineVideo(url: url, isUserImport: false, debug: false)
+    }
+
+    /// 调试模式：同一段离线视频，但跑完一遍就停（不循环），随后出报告。
+    private func switchToDebugVideo() {
+        guard let url = customVideoURL ?? Self.bundledVideoURL else {
+            status = .failed("找不到内置测试视频 sample_whiteboard.mp4")
+            return
+        }
+        prepareOfflineVideo(url: url, isUserImport: false, debug: true)
     }
 
     private func switchToLiveCamera() {
@@ -212,10 +259,11 @@ final class BoardViewModel: ObservableObject {
     /// **全部放到后台**：用户选的 raw 录像可能有几百 MB ~ 几 GB，若还在 iCloud Drive
     /// 里没下载，`copyItem` 会先同步触发整个下载——在主线程做这件事就是几十秒的假死
     /// （用户报的"卡住"）。解码器初始化（`AVURLAsset.loadTracks`）同理。
-    private func prepareOfflineVideo(url: URL, isUserImport: Bool) {
+    private func prepareOfflineVideo(url: URL, isUserImport: Bool, debug: Bool) {
         guard !isImporting else { return }
         isImporting = true
-        status = .preparing(isUserImport ? "正在导入 \(url.lastPathComponent)…" : "正在打开测试视频…")
+        status = .preparing(isUserImport ? "正在导入 \(url.lastPathComponent)…"
+                                         : (debug ? "正在准备调试素材…" : "正在打开测试视频…"))
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
@@ -230,17 +278,21 @@ final class BoardViewModel: ObservableObject {
                 guard let device = MTLCreateSystemDefaultDevice() else {
                     throw VideoSourceError.textureCacheFailed
                 }
-                let source = try VideoFrameSource(url: videoURL, device: device)
+                // 调试模式：不循环，放完停在最后一帧
+                let source = try VideoFrameSource(url: videoURL, device: device, loops: !debug)
 
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.isImporting = false
                     if isUserImport { self.customVideoURL = videoURL }
-                    self.inputMode = .offline
+                    self.inputMode = debug ? .debug : .offline
                     self.videoSource = source
                     self.videoFileName = videoURL.lastPathComponent
                     self.sourceDescription = videoURL.lastPathComponent
                     self.camera.stop()
+                    if debug {
+                        source.onFinished = { [weak self] in self?.debugRunDidFinish() }
+                    }
                     self.build(source: source, size: source.resolution)
                 }
             } catch {
@@ -262,7 +314,7 @@ final class BoardViewModel: ObservableObject {
 
     /// 用户自选视频。真正的导入放在后台，界面立刻响应并显示进度。
     func useCustomVideo(url: URL) {
-        prepareOfflineVideo(url: url, isUserImport: true)
+        prepareOfflineVideo(url: url, isUserImport: true, debug: inputMode.isDebug)
     }
 
     /// 把外部视频拷贝到 Documents/Videos。
@@ -368,6 +420,9 @@ final class BoardViewModel: ObservableObject {
                   + "管线\(Int(pipelineSize.width))x\(Int(pipelineSize.height))，"
                   + "分割输入 \(provider.inputWidth)x\(provider.inputHeight)，节点 \(pipeline.nodes.count)")
 
+            if inputMode.isDebug {
+                startDebugRun(pipeline: pipeline, size: pipelineSize)
+            }
             startStatsPolling()
         } catch {
             status = .failed("初始化失败：\(error.localizedDescription)")
@@ -381,38 +436,204 @@ final class BoardViewModel: ObservableObject {
         statsTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self else { return }
             tick += 1
-            self.fps = self.renderer?.stats.fps ?? 0
-            self.frameMillis = self.renderer?.stats.lastFrameMillis ?? 0
-            self.inferenceMillis = self.pipeline?.segmentation.lastInferenceMillis ?? 0
-            self.foregroundRatio = self.pipeline?.segmentation.lastForegroundRatio ?? 0
-            let device = self.deviceStats.sample()
-            self.residentMemoryMB = device.residentMB
-            self.availableMemoryMB = device.availableMB
-            self.cpuPercent = device.cpuPercent
-            self.thermalStateText = self.deviceStats.thermalStateText
-            self.batteryLevel = device.batteryLevel
-            self.batteryDrainPerHour = device.batteryDrainPercentPerHour
-            if tick % 4 == 0 {
-                var extra = ""
-                if let video = self.videoSource {
-                    extra = " 解码\(video.decodedFrames)帧 循环\(video.loopCount)次"
-                }
-                let age = self.pipeline?.segmentation.lastMaskAgeFrames ?? 0
-                _ = age
-                var power = String(format: "内存%.0fMB 可用%.0fMB CPU%.0f%% 热%@",
-                                   device.residentMB, device.availableMB,
-                                   device.cpuPercent, self.deviceStats.thermalStateText)
-                if device.batteryLevel >= 0 {
-                    power += String(format: " 电量%.0f%%", device.batteryLevel * 100)
-                    if device.batteryDrainPercentPerHour > 0 {
-                        power += String(format: " 耗电%.1f%%/h", device.batteryDrainPercentPerHour)
-                    }
-                }
-                print(String(format: "[STAT] %@ %.1ffps 帧%.1fms 分割%.0fms 前景%.1f%% mask滞后%.0f帧(峰值%.0f) %@%@",
-                             self.inputMode.rawValue, self.fps, self.frameMillis,
-                             self.inferenceMillis, self.foregroundRatio * 100,
-                             Double(age), Double(self.pipeline?.segmentation.maxMaskAgeFrames ?? 0), power, extra))
+            self.refreshStats()
+            if tick % 4 == 0 { self.logStats() }
+        }
+    }
+
+    /// 采样一次：刷新界面指标；调试模式下同时记进报告序列并推进进度条。
+    ///
+    /// 注意 `DeviceStats.sample()` 靠「距上次采样的时间差」算 CPU 占用，
+    /// 因此一轮轮询里只能调用一次——多调会让间隔趋近于 0，CPU% 就失去意义了。
+    private func refreshStats() {
+        fps = renderer?.stats.fps ?? 0
+        frameMillis = renderer?.stats.lastFrameMillis ?? 0
+        inferenceMillis = pipeline?.segmentation.lastInferenceMillis ?? 0
+        foregroundRatio = pipeline?.segmentation.lastForegroundRatio ?? 0
+
+        let device = deviceStats.sample()
+        residentMemoryMB = device.residentMB
+        availableMemoryMB = device.availableMB
+        cpuPercent = device.cpuPercent
+        thermalStateText = deviceStats.thermalStateText
+        batteryLevel = device.batteryLevel
+        batteryDrainPerHour = device.batteryDrainPercentPerHour
+
+        guard inputMode.isDebug, debugPhase == .running else { return }
+        recorder.append(fps: fps,
+                        frameMillis: frameMillis,
+                        inferenceMillis: inferenceMillis,
+                        residentMB: device.residentMB,
+                        availableMB: device.availableMB,
+                        cpuPercent: device.cpuPercent,
+                        thermal: device.thermalState,
+                        batteryLevel: Double(device.batteryLevel),
+                        drainPercentPerHour: device.batteryDrainPercentPerHour)
+        if let video = videoSource, video.estimatedFrames > 0 {
+            debugProgress = min(1, Double(video.decodedFrames) / Double(video.estimatedFrames))
+        }
+    }
+
+    private func logStats() {
+        var extra = ""
+        if let video = videoSource {
+            extra = " 解码\(video.decodedFrames)帧 循环\(video.loopCount)次"
+        }
+        var power = String(format: "内存%.0fMB 可用%.0fMB CPU%.0f%% 热%@",
+                           residentMemoryMB, availableMemoryMB, cpuPercent, deviceStats.thermalStateText)
+        if batteryLevel >= 0 {
+            power += String(format: " 电量%.0f%%", batteryLevel * 100)
+            if batteryDrainPerHour > 0 {
+                power += String(format: " 耗电%.1f%%/h", batteryDrainPerHour)
             }
+        }
+        print(String(format: "[STAT] %@ %.1ffps 帧%.1fms 分割%.0fms 前景%.1f%% mask滞后%.0f帧(峰值%.0f) %@%@",
+                     inputMode.rawValue, fps, frameMillis,
+                     inferenceMillis, foregroundRatio * 100,
+                     Double(pipeline?.segmentation.lastMaskAgeFrames ?? 0),
+                     Double(pipeline?.segmentation.maxMaskAgeFrames ?? 0), power, extra))
+    }
+
+    // MARK: - 调试模式
+
+    /// 管线就绪后启动一次调试跑测。
+    private func startDebugRun(pipeline: FullPipeline, size: CGSize) {
+        tearDownExport()
+        report = nil
+        processedVideoURL = nil
+        reportCSVURL = nil
+        saveVideoMessage = nil
+        debugProgress = 0
+        isReportPresented = false
+        canvasPaused = false
+        debugPhase = .running
+        recorder.start()
+        // 先采一次：让 CPU% 有个基准点，并把耗电计时的起点定在这里
+        _ = deviceStats.sample()
+        print("[Debug] 开始跑测：\(videoFileName)，预计 \(videoSource?.estimatedFrames ?? 0) 帧")
+
+        guard isRecordingProcessedVideo else { return }
+        guard let writer = try? ProcessedVideoWriter(size: size) else {
+            print("[Debug] 处理后视频写入器创建失败，本次只出报告")
+            return
+        }
+        exportWriter = writer
+        renderer?.recordHandle = pipeline.handles.final
+        renderer?.recordSink = { [weak writer] texture in writer?.append(texture) }
+        print("[Debug] 开始录制处理结果 \(Int(size.width))x\(Int(size.height))")
+    }
+
+    /// 视频放完一遍：收尾采样、停渲染循环、生成报告。
+    private func debugRunDidFinish() {
+        guard inputMode.isDebug, debugPhase == .running else { return }
+
+        // 收尾再采一次（此时 debugPhase 还是 .running，会被记进序列）
+        refreshStats()
+        debugPhase = .finished
+        statsTimer?.invalidate()
+        statsTimer = nil
+        recorder.stop()
+        debugProgress = 1
+        canvasPaused = true
+        renderer?.recordHandle = nil
+        renderer?.recordSink = nil
+
+        finishExport()
+
+        let finished = recorder.makeReport(title: videoFileName.isEmpty ? "离线素材" : videoFileName,
+                                          resolution: videoSource?.resolution ?? .zero,
+                                          frames: videoSource?.decodedFrames ?? 0)
+        report = finished
+        reportCSVURL = Self.writeReportCSV(finished)
+        isReportPresented = true
+        print("[Debug] 跑测结束：\(finished.frames) 帧，平均 "
+              + String(format: "%.1ffps", finished.meanFPS))
+    }
+
+    /// 重新跑一遍：解码器归零 + 重建管线（清掉时序累积等持久纹理的残留）。
+    func replayDebugRun() {
+        guard inputMode.isDebug, let video = videoSource else { return }
+        isReportPresented = false
+        tearDownExport()
+        report = nil
+        processedVideoURL = nil
+        reportCSVURL = nil
+        saveVideoMessage = nil
+        debugProgress = 0
+        debugPhase = .idle
+        video.rewindAndRestart()
+        build(source: video, size: video.resolution)
+    }
+
+    /// 把处理后的视频存进系统相册。
+    func saveProcessedVideoToPhotos() {
+        guard let url = processedVideoURL else {
+            saveVideoMessage = "还没有生成处理后的视频"
+            return
+        }
+        guard !isSavingVideo else { return }
+        isSavingVideo = true
+        saveVideoMessage = nil
+        PhotoLibrarySaver.saveVideo(at: url) { [weak self] result in
+            guard let self else { return }
+            self.isSavingVideo = false
+            switch result {
+            case .success:              self.saveVideoMessage = "已保存到相册"
+            case .failure(let error):   self.saveVideoMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func finishExport() {
+        guard let writer = exportWriter else { return }
+        exportWriter = nil
+        writer.finish { [weak self] result in
+            switch result {
+            case .success(let url):
+                self?.processedVideoURL = url
+                print("[Debug] 处理结果已写入 \(url.lastPathComponent)（"
+                      + "\(writer.encodedFrames) 帧，丢弃 \(writer.droppedFrames) 帧）")
+            case .failure(let error):
+                self?.saveVideoMessage = "处理视频生成失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func tearDownExport() {
+        renderer?.recordHandle = nil
+        renderer?.recordSink = nil
+        exportWriter?.cancel()
+        exportWriter = nil
+    }
+
+    private func resetDebugState() {
+        tearDownExport()
+        recorder.stop()
+        report = nil
+        processedVideoURL = nil
+        reportCSVURL = nil
+        saveVideoMessage = nil
+        debugProgress = 0
+        debugPhase = .idle
+        canvasPaused = false
+        isReportPresented = false
+    }
+
+    /// 把报告明细写进 Documents/，便于跑完用 devicectl 把原始数据拉回本机分析。
+    private static func writeReportCSV(_ report: RunReport) -> URL? {
+        guard let documents = FileManager.default.urls(for: .documentDirectory,
+                                                       in: .userDomainMask).first else { return nil }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        let url = documents.appendingPathComponent("digiboard-report-\(formatter.string(from: Date())).csv")
+        do {
+            try report.csv().write(to: url, atomically: true, encoding: .utf8)
+            print("[Debug] 报告明细已写入 \(url.path)")
+            return url
+        } catch {
+            print("[Debug] 报告 CSV 写入失败：\(error)")
+            return nil
         }
     }
 

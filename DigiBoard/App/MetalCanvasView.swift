@@ -8,6 +8,9 @@ import SwiftUI
 struct MetalCanvasView: UIViewRepresentable {
     let renderer: Renderer
     var preferredFPS: Int = 30
+    /// 暂停渲染循环。调试模式跑完一遍后置 true：画面停在最后一帧（不再解码、不再耗电），
+    /// 报告卡片叠在静止的终帧上。`MTKView` 会保留最后presented的 drawable，画面不会丢。
+    var isPaused: Bool = false
 
     func makeUIView(context: Context) -> MTKView {
         let view = MTKView(frame: .zero, device: renderer.metal.device)
@@ -16,7 +19,7 @@ struct MetalCanvasView: UIViewRepresentable {
         view.preferredFramesPerSecond = preferredFPS
         view.framebufferOnly = false
         view.enableSetNeedsDisplay = false
-        view.isPaused = false
+        view.isPaused = isPaused
         view.clearColor = MTLClearColorMake(0.06, 0.07, 0.09, 1)
         view.autoResizeDrawable = true
         view.isUserInteractionEnabled = false
@@ -30,5 +33,8 @@ struct MetalCanvasView: UIViewRepresentable {
             uiView.delegate = renderer
         }
         uiView.preferredFramesPerSecond = preferredFPS
+        if uiView.isPaused != isPaused {
+            uiView.isPaused = isPaused
+        }
     }
 }

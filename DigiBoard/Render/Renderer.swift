@@ -36,6 +36,14 @@ final class Renderer: NSObject, MTKViewDelegate {
     /// 这样即使目标纹理是「本帧用完就回收」的也可以抓。
     private var captureStaging: [(MTLTexture, URL)] = []
 
+    /// 逐帧录制（调试模式）：每帧把指定句柄的内容 blit 到一张 shared 暂存纹理，
+    /// GPU 完成后在后台串行队列交给 `recordSink`（拿去编码成视频）。
+    /// 置 nil 即停止录制。
+    var recordHandle: TextureHandle?
+    var recordSink: ((MTLTexture) -> Void)?
+    private(set) var recordedFrameCount = 0
+    private let recordQueue = DispatchQueue(label: "com.zhuanz.digiboard.record", qos: .userInitiated)
+
     init?(nodes: [PipelineNode]) {
         guard let metal = MetalContext() else { return nil }
         self.metal = metal
@@ -165,6 +173,29 @@ final class Renderer: NSObject, MTKViewDelegate {
             blit?.endEncoding()
         }
 
+        // 3.6) 逐帧录制：把处理结果拷到 shared 暂存纹理，GPU 完成后后台编码。
+        //      回读放在命令缓冲完成回调里做，渲染线程只负责一次 blit。
+        var recordPending: (MTLTexture, (MTLTexture) -> Void)?
+        if let handle = recordHandle, let sink = recordSink,
+           let source = try? ctx.texture(handle) {
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: source.pixelFormat,
+                                                                      width: source.width,
+                                                                      height: source.height,
+                                                                      mipmapped: false)
+            descriptor.storageMode = .shared
+            descriptor.usage = [.shaderRead]
+            if let staging = metal.device.makeTexture(descriptor: descriptor),
+               let blit = commandBuffer.makeBlitCommandEncoder() {
+                blit.copy(from: source, sourceSlice: 0, sourceLevel: 0,
+                          sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                          sourceSize: MTLSize(width: source.width, height: source.height, depth: 1),
+                          to: staging, destinationSlice: 0, destinationLevel: 0,
+                          destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                blit.endEncoding()
+                recordPending = (staging, sink)
+            }
+        }
+
         // 4) 非 persistent 纹理在 GPU 用完之后才归还池中，
         //    否则会和仍在 in-flight 的命令缓冲抢同一张纹理。
         // 需要在 GPU 完成后回读的纹理（边缘图 / 分割输入）
@@ -217,6 +248,14 @@ final class Renderer: NSObject, MTKViewDelegate {
                     }
                 }
             }
+
+            // 逐帧录制：暂存纹理是本帧独有的，可以安全地在后台队列慢慢回读
+            if let (staging, sink) = recordPending {
+                self.recordQueue.async {
+                    self.recordedFrameCount += 1
+                    sink(staging)
+                }
+            }
             self.stats.record(gpuSeconds: buffer.gpuEndTime - buffer.gpuStartTime,
                               cpuSeconds: cpuSeconds)
             self.inFlight.signal()
@@ -250,26 +289,38 @@ private extension FrameContext {
 }
 
 /// 简单的帧计时统计，用于 P2 的 30fps 验收。
+///
+/// fps 用「最近 N 帧的间隔」滚动计算，而不是「满 1 秒才更新一次」的窗口平均——
+/// 后者每秒钟才跳一次，界面上的读数看起来像写死的；滚动窗口每一帧都在更新，
+/// 负载上升（帧耗时变长）时立刻掉下来。
 final class FrameStats {
     private(set) var frameCount = 0
     private(set) var lastGPUMillis: Double = 0
     /// 最近一帧的 CPU 侧耗时（阶段编码 + 提交）
     private(set) var lastFrameMillis: Double = 0
-    private var windowStart = CACurrentMediaTime()
-    private var windowFrames = 0
+    /// 最近若干帧的帧间隔（秒），用于滚动 fps
+    private var intervals: [Double] = []
+    private let intervalWindow = 30
+    private var lastFrameTimestamp: CFTimeInterval = 0
     private(set) var fps: Double = 0
 
     func record(gpuSeconds: CFTimeInterval, cpuSeconds: CFTimeInterval = 0) {
         frameCount += 1
         if cpuSeconds > 0 { lastFrameMillis = cpuSeconds * 1000 }
-        windowFrames += 1
         if gpuSeconds > 0 { lastGPUMillis = gpuSeconds * 1000 }
+
         let now = CACurrentMediaTime()
-        let elapsed = now - windowStart
-        if elapsed >= 1.0 {
-            fps = Double(windowFrames) / elapsed
-            windowFrames = 0
-            windowStart = now
+        if lastFrameTimestamp > 0 {
+            let delta = now - lastFrameTimestamp
+            // 丢掉异常间隔（切后台、首帧、卡顿超过 1s），否则会被拉成没有意义的低值
+            if delta > 0, delta < 1 {
+                intervals.append(delta)
+                if intervals.count > intervalWindow { intervals.removeFirst() }
+            }
         }
+        lastFrameTimestamp = now
+
+        let total = intervals.reduce(0, +)
+        fps = total > 0 ? Double(intervals.count) / total : 0
     }
 }

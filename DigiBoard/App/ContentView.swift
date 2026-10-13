@@ -18,7 +18,7 @@ struct ContentView: View {
             Color.black.ignoresSafeArea()
 
             if let renderer = model.renderer {
-                MetalCanvasView(renderer: renderer, preferredFPS: 30)
+                MetalCanvasView(renderer: renderer, preferredFPS: 30, isPaused: model.canvasPaused)
                     .ignoresSafeArea()
 
                 VStack(spacing: 0) {
@@ -40,6 +40,18 @@ struct ContentView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .sheet(isPresented: $model.isReportPresented) {
+            if let report = model.report {
+                RunReportView(report: report,
+                              processedVideoURL: model.processedVideoURL,
+                              reportCSVURL: model.reportCSVURL,
+                              isSaving: model.isSavingVideo,
+                              saveMessage: model.saveVideoMessage,
+                              onSaveToPhotos: { model.saveProcessedVideoToPhotos() },
+                              onReplay: { model.replayDebugRun() },
+                              onClose: { model.isReportPresented = false })
+            }
+        }
         .fileImporter(isPresented: $showingVideoPicker,
                       allowedContentTypes: [.movie, .video],
                       allowsMultipleSelection: false) { result in
@@ -68,7 +80,8 @@ struct ContentView: View {
             HStack(spacing: 9) {
                 chip(statusText, systemImage: "video.fill")
                 if model.fps > 0 {
-                    chip(String(format: "%.0f fps", model.fps), systemImage: "speedometer")
+                    // 一帧一算：读数是实测帧率，不是写死的 30
+                    chip(String(format: "%.1f fps", model.fps), systemImage: "speedometer")
                 }
                 if model.inferenceMillis > 0 {
                     chip(String(format: "分割 %.0f ms", model.inferenceMillis),
@@ -128,7 +141,9 @@ struct ContentView: View {
                 .pickerStyle(.segmented)
                 .disabled(model.isImporting)
 
-                if model.inputMode == .offline {
+                if model.inputMode == .debug {
+                    debugCard
+                } else if model.inputMode == .offline {
                     videoCard
                 } else {
                     Label("实时相机画面", systemImage: "camera.fill")
@@ -233,6 +248,72 @@ struct ContentView: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
             .background(.ultraThinMaterial, in: Capsule())
+    }
+
+    // MARK: - 调试模式卡片
+
+    /// 调试模式：同一段离线视频，但只跑一遍，放完出资源报告，并可导出处理后的视频。
+    private var debugCard: some View {
+        VStack(spacing: 10) {
+            videoCard
+
+            if model.debugPhase == .running {
+                VStack(spacing: 6) {
+                    ProgressView(value: model.debugProgress)
+                        .tint(.white)
+                    HStack {
+                        Text("正在跑测一遍（不循环）")
+                        Spacer()
+                        Text(String(format: "%.0f%%", model.debugProgress * 100))
+                            .monospacedDigit()
+                    }
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.7))
+                }
+            } else {
+                Text(model.debugPhase == .finished
+                     ? "跑完了：可查看报告，或重新播放再跑一遍"
+                     : "调试模式：播放一遍后给出资源报告（fps / 内存 / 热 / 电量），并支持把处理后的视频存到相册")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.6))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Toggle(isOn: $model.isRecordingProcessedVideo) {
+                Text("保存处理后的视频")
+                    .font(.system(size: 12, weight: .medium))
+            }
+            .toggleStyle(SwitchToggleStyle(tint: .blue))
+            .disabled(model.debugPhase == .running || model.isImporting)
+
+            HStack(spacing: 10) {
+                Button {
+                    model.isReportPresented = true
+                } label: {
+                    Label("查看报告", systemImage: "chart.bar.xaxis")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white)
+                .background(.white.opacity(model.report == nil ? 0.08 : 0.18), in: Capsule())
+                .disabled(model.report == nil)
+
+                Button {
+                    model.replayDebugRun()
+                } label: {
+                    Label("重新播放", systemImage: "arrow.clockwise")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white)
+                .background(.white.opacity(0.18), in: Capsule())
+                .disabled(model.debugPhase == .running || model.isImporting)
+            }
+        }
     }
 }
 

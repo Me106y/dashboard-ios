@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DigiBoard iOS — 产品与移植文档 v0.8</title>
+  <title>DigiBoard iOS — 产品与移植文档 v0.9</title>
   <link rel="stylesheet" href="prd-styles.css">
 </head>
 <body>
@@ -43,6 +43,7 @@
         <a href="#video">视频测试与范围收敛</a>
         <a href="#fix-video">选视频问题修复</a>
         <a href="#ghost">人像边缘叠影修复</a>
+        <a href="#debug-mode">调试模式</a>
         <a href="#changelog">变更记录</a>
       </nav>
       <div class="sidebar-note">
@@ -58,9 +59,9 @@
           <h1>DigiBoard iOS</h1>
           <p class="hero-lead">相机取景 → 人像分割 → 时序背景重建（去遮挡）→ 透视校正 → 图像增强 → 全屏显示。</p>
           <div class="meta-row" aria-label="文档元数据">
-            <span>版本 0.8</span>
-            <span>状态：离线视频测试可用 · 选视频问题已修复</span>
-            <span>更新：2026-10-08</span>
+            <span>版本 0.9</span>
+            <span>状态：新增调试模式（跑测一遍 + 资源报告 + 处理后视频存相册）</span>
+            <span>更新：2026-10-13</span>
           </div>
         </div>
         <div class="hero-summary" aria-label="核心结论">
@@ -1188,6 +1189,40 @@
         </article>
       </section>
 
+      <section class="doc-section" id="debug-mode">
+        <div class="section-heading">
+          <h2>调试模式</h2>
+          <p>输入源从两种变三种：<strong>实时视频 / 离线视频 / 调试模式</strong>。调试模式复用离线视频的解码链路，但用途是「量化跑测」而不是「循环演示」。</p>
+        </div>
+
+        <article class="gate-spec">
+          <header>
+            <div><span class="gate-number">R21</span><h3>跑测一遍 → 资源报告 → 处理后视频存相册</h3></div>
+            <span class="enforcement-badge">第三种输入源</span>
+          </header>
+          <div class="table-wrap compact">
+            <table>
+              <thead><tr><th>行为</th><th>实时视频</th><th>离线视频</th><th>调试模式</th></tr></thead>
+              <tbody>
+                <tr><td>播放</td><td>相机实时</td><td>循环</td><td><strong>跑一遍就停</strong></td></tr>
+                <tr><td>结束后</td><td>—</td><td>继续循环</td><td><strong>停在终帧 + 弹资源报告</strong></td></tr>
+                <tr><td>报告内容</td><td>—</td><td>—</td><td>fps / 内存 / CPU 曲线 + 最高热档 + 电量与耗电速率</td></tr>
+                <tr><td>导出</td><td>—</td><td>—</td><td><strong>处理后的视频存进相册</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p><strong>实现要点</strong>：<code>VideoFrameSource(url:device:loops:)</code> 新增 <code>loops</code>（默认 <code>true</code>，既有调用不变）；<code>loops == false</code> 时到尾部置 <code>isFinished</code>、停在最后一帧并回调一次 <code>onFinished</code>，<code>rewindAndRestart()</code> 供「重新播放」用（重播会重建管线，清掉时序累积的残余）。0.5s 轮询的每轮采样存进 <code>RunRecorder</code>，跑完出 <code>RunReport</code>（均值 / 极值 / P5、内存增长、峰值 CPU、最高热档、电量起止与耗电速率）。<code>Renderer</code> 新增逐帧录制钩子，把 <code>enhance.final</code> blit 到 shared 暂存纹理后回读，经 <code>ProcessedVideoWriter</code>（<code>AVAssetWriter</code> + H.264，按真实时间戳写入）编码，再用 <code>PHPhotoLibrary</code> 存相册（<code>NSPhotoLibraryAddUsageDescription</code>，仅「仅添加」权限）。</p>
+          <div class="spec-note">
+            <strong>fps 读数改成逐帧计算</strong>
+            <p><code>FrameStats</code> 原先「满 1 秒才算一次窗口平均」，读数每秒才跳一格，看起来像写死的 30；改为最近 30 帧的帧间隔滚动计算，每一帧都在更新，顶部状态条显示一位小数（<code>30.0 fps</code>）。稳态仍是 ~30，因为画布按部署目标锁在 <code>preferredFramesPerSecond = 30</code>——那是刻意保留的 30fps 预算，不是读数卡死。录制会多一次 blit + 回读，想要干净的 fps 读数就把「保存处理后的视频」关掉再跑一遍做对照。</p>
+          </div>
+          <div class="spec-note">
+            <strong>未编译验证</strong>
+            <p>Swift 改动在 Windows 上编写，<strong>未经 Xcode 编译</strong>。已做静态核对（括号配平、参数标签与顺序、新增文件落在同步文件夹覆盖范围内）。待确认：① 导出视频的<strong>朝向</strong>（与 <code>DB_CAPTURE</code> 抓帧同源，逐行回读、不做额外翻转，预期与抓帧 PNG 一致）；② 录制对 fps 读数的影响量级。</p>
+          </div>
+        </article>
+      </section>
+
       <section class="doc-section" id="changelog">
         <div class="section-heading">
           <h2>变更记录</h2>
@@ -1200,6 +1235,11 @@
               <tr><th>版本</th><th>日期</th><th>说明</th></tr>
             </thead>
             <tbody>
+              <tr>
+                <td>v0.9</td>
+                <td>2026-10-13</td>
+                <td><strong>新增调试模式</strong>：离线视频跑一遍即停（<code>VideoFrameSource(loops:)</code> 非循环 + 结束回调）+ 结束后停在终帧并弹出资源报告（fps / 内存 / CPU 曲线、最高热档、电量与耗电速率，<code>RunReport</code> / <code>RunReportView</code>）+ 处理后视频可存相册（<code>Renderer</code> 逐帧录制钩子 → <code>ProcessedVideoWriter</code> → Photos）。fps 读数改为最近 30 帧滚动计算并显示一位小数。新增 <code>DebugRunTests</code>。Swift 侧未经 Xcode 编译验证</td>
+              </tr>
               <tr>
                 <td>v0.8</td>
                 <td>2026-10-09</td>
@@ -1251,7 +1291,7 @@
           </div>
           <div>
             <strong>审核状态</strong>
-            <span>人像边缘叠影已修复</span>
+            <span>调试模式已加入，待真机编译验证</span>
           </div>
           <div>
             <strong>下次更新</strong>
@@ -1265,8 +1305,8 @@
   <button class="back-to-top" id="back-to-top" aria-label="回到顶部">↑</button>
 
   <footer>
-    <p>DigiBoard · iOS 版 · 产品与移植文档 v0.8</p>
-    <p>2026-10-08</p>
+    <p>DigiBoard · iOS 版 · 产品与移植文档 v0.9</p>
+    <p>2026-10-13</p>
   </footer>
 
   <script>
